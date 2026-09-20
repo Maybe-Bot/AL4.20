@@ -171,10 +171,9 @@ Off execution does not touch the network.
 
 ## Reward interface
 
-The version 1 reward provider returns survived age only. Each completed living
-tick advances both age and accumulated reward in every lifecycle state. Awake
-organisms receive both values as bounded inputs on a later tick. Sleeping and
-off organisms still age even though they receive no fresh inputs.
+The version 1 reward provider returns survived biological age only. Each
+completed living tick advances chronological age by one and advances biological
+age and reward at the configured lifecycle-state rate.
 
 Reward calculation is a substrate service, not reproduction code. A later
 experiment can add an external computational reward without changing organism
@@ -189,7 +188,8 @@ all authorization rules. A birth requires:
 - both organisms in the awake state;
 - request and acceptance signals that satisfy the mating policy;
 - both organisms at or above the configured maturity age;
-- both organisms passing the monotonic age-opportunity gate;
+- both organisms passing the monotonic biological-age opportunity gate;
+- an exclusive courtship that maintains consent for the configured duration;
 - available, valid dimensions for an offspring; and
 - a child genome that passes finite-value and bounds validation.
 
@@ -207,10 +207,10 @@ genome contract. The child records both parent IDs and a generation one greater
 than the greater parent generation.
 
 Before maturity, every request is rejected. After maturity, a simple
-linear function increases reproductive opportunity with age:
+linear function increases reproductive opportunity with biological age:
 
 ```text
-progress = clamp((age - maturity_age) / reproduction_ramp_ticks, 0, 1)
+progress = clamp((biological_age - maturity_age) / reproduction_ramp_ticks, 0, 1)
 opportunity = base_probability
               + progress * (max_probability - base_probability)
 ```
@@ -228,6 +228,20 @@ mutate one another's state.
 
 Version 1 communication is deliberately low bandwidth and has no language,
 addresses, network transport, or persistent external channel.
+
+## Courtship and age
+
+The substrate pairs eligible organisms by stable ID. A pair is exclusive and
+must remain awake and mutually consenting for `courtship_duration_ticks`
+consecutive ticks. Sleep, off, death, ineligibility, or withdrawn consent clears
+both sides and discards progress. Courting partners exchange one private scalar
+neural signal; the substrate delivers it only to the reciprocal partner.
+
+Chronological age counts every living simulation tick and controls oldest-first
+capacity eviction. Biological age uses fixed-point microticks (one biological
+tick equals 1,000,000 units) and the configured awake, sleep, or off rate. It
+controls maturity, reproductive opportunity, and survived-age reward. Remaining
+asleep or off longer than `max_without_awake_days` causes `dormancy_timeout`.
 
 ## Population storage and capacity
 

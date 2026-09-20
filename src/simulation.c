@@ -53,7 +53,8 @@ bool alife_layout_create(const AlifeConfig *config, AlifeLayout *layout,
     }
     hidden = (size_t)config->hidden_size;
     communication = (size_t)config->communication_size;
-    inputs = (size_t)config->input_size + communication;
+    inputs = (size_t)config->input_size + communication +
+             ALIFE_PRIVATE_COURTSHIP_INPUTS;
     if (hidden > ALIFE_MAX_HIDDEN || inputs > ALIFE_MAX_INPUTS ||
         communication > ALIFE_MAX_COMMUNICATION) {
         alife_set_error(error, error_size, "The neural dimensions exceed runtime limits.");
@@ -221,7 +222,8 @@ static float bounded_gene(const AlifeWorld *world, double value) {
 static void seed_sleep_rhythm(const AlifeWorld *world, float *genome) {
     const size_t hidden = (size_t)world->config.hidden_size;
     const size_t input_count = (size_t)world->config.input_size +
-                               (size_t)world->config.communication_size;
+                               (size_t)world->config.communication_size +
+                               ALIFE_PRIVATE_COURTSHIP_INPUTS;
     const size_t communication = (size_t)world->config.communication_size;
     const size_t x = ALIFE_SLEEP_OSCILLATOR_X;
     const size_t y = ALIFE_SLEEP_OSCILLATOR_Y;
@@ -385,6 +387,7 @@ static bool append_organism(AlifeWorld *world, const float *genome,
     organism->birth_month = world->month;
     organism->birth_day = world->day;
     organism->state = ALIFE_STATE_AWAKE;
+    organism->last_awake_tick = world->tick;
     organism->last_foolsday_roll_year = INT32_MIN;
     slot = alife_slot(world, world->count);
     memset(slot, 0, world->layout.slot_floats * sizeof(*slot));
@@ -537,8 +540,46 @@ bool alife_world_init(AlifeWorld *world, const AlifeConfig *config,
     return true;
 }
 
+static size_t find_index(const AlifeWorld *world, uint64_t id);
+
+static void cancel_courtship(AlifeWorld *world, uint64_t organism_id,
+                             const char *reason) {
+    AlifeOrganism *organism = alife_find_organism_mut(world, organism_id);
+    AlifeOrganism *partner;
+    uint64_t partner_id;
+    uint64_t progress;
+
+    if (organism == NULL || organism->courtship_partner_id == 0U) {
+        return;
+    }
+    partner_id = organism->courtship_partner_id;
+    progress = organism->courtship_progress;
+    partner = alife_find_organism_mut(world, partner_id);
+    organism->courtship_partner_id = 0U;
+    organism->courtship_progress = 0U;
+    organism->courtship_input = 0.0F;
+    if (partner != NULL && partner->courtship_partner_id == organism_id) {
+        partner->courtship_partner_id = 0U;
+        partner->courtship_progress = 0U;
+        partner->courtship_input = 0.0F;
+    }
+    if (world->active_courtships > 0U) {
+        --world->active_courtships;
+    }
+    ++world->courtships_failed;
+    alife_log_courtship(world, "courtship_failed", organism_id, partner_id,
+                        progress, reason);
+}
+
 static void remove_at(AlifeWorld *world, size_t index, AlifeDeathCause cause) {
     size_t last = world->count - 1U;
+    uint64_t id = world->organisms[index].id;
+
+    if (world->organisms[index].courtship_partner_id != 0U) {
+        cancel_courtship(world, id, "death");
+        index = find_index(world, id);
+        last = world->count - 1U;
+    }
 
     alife_log_death(world, &world->organisms[index], cause);
     ++world->total_deaths;
@@ -629,6 +670,8 @@ static void clear_public_outputs(AlifeWorld *world, size_t index) {
 
     organism->reproduction_output = 0.0F;
     organism->acceptance_output = 0.0F;
+    organism->courtship_output = 0.0F;
+    organism->courtship_input = 0.0F;
     organism->sent_message_this_tick = false;
     for (i = 0U; i < (size_t)world->config.communication_size; ++i) {
         slot[world->layout.inbox + i] = 0.0F;
@@ -683,7 +726,16 @@ static bool transition_at(AlifeWorld *world, size_t index,
     organism->back_on_tick = requested_state == ALIFE_STATE_OFF ?
                              world->tick + duration : 0U;
     if (requested_state != ALIFE_STATE_AWAKE) {
+        if (organism->courtship_partner_id != 0U) {
+            uint64_t id = organism->id;
+            cancel_courtship(world, id,
+                             requested_state == ALIFE_STATE_ASLEEP ?
+                             "sleep" : "off");
+            organism = alife_find_organism_mut(world, id);
+        }
         clear_public_outputs(world, index);
+    } else {
+        organism->last_awake_tick = world->tick;
     }
     count_transition = world->total_state_transitions < UINT64_MAX;
     if (count_transition) {
@@ -783,12 +835,16 @@ bool alife_organism_state_valid(const AlifeWorld *world, size_t index) {
         !isfinite((double)organism->wake_output) ||
         !isfinite((double)organism->off_output) ||
         !isfinite((double)organism->off_duration_output) ||
+        !isfinite((double)organism->courtship_output) ||
+        !isfinite((double)organism->courtship_input) ||
         fabs((double)organism->reproduction_output) > 1.0001 ||
         fabs((double)organism->acceptance_output) > 1.0001 ||
         fabs((double)organism->sleep_output) > 1.0001 ||
         fabs((double)organism->wake_output) > 1.0001 ||
         fabs((double)organism->off_output) > 1.0001 ||
         fabs((double)organism->off_duration_output) > 1.0001 ||
+        fabs((double)organism->courtship_output) > 1.0001 ||
+        fabs((double)organism->courtship_input) > 1.0001 ||
         (organism->state == ALIFE_STATE_OFF &&
          organism->back_on_tick <= world->tick)) {
         return false;
@@ -821,13 +877,16 @@ double alife_reproduction_probability(const AlifeWorld *world,
     double progress;
 
     if (world == NULL || organism == NULL ||
-        organism->age < world->config.maturity_age) {
+        organism->biological_age / ALIFE_BIOLOGICAL_AGE_SCALE <
+            world->config.maturity_age) {
         return 0.0;
     }
     if (world->config.reproduction_ramp_ticks == 0U) {
         return world->config.reproduction_max_probability;
     }
-    progress = (double)(organism->age - world->config.maturity_age) /
+    progress = ((double)organism->biological_age /
+                (double)ALIFE_BIOLOGICAL_AGE_SCALE -
+                (double)world->config.maturity_age) /
                (double)world->config.reproduction_ramp_ticks;
     progress = clamp_double(progress, 0.0, 1.0);
     return world->config.reproduction_base_probability +
@@ -840,7 +899,8 @@ bool alife_reproduction_eligible(const AlifeWorld *world,
     return world != NULL && organism != NULL && !world->stopped &&
            !(world->month == 4 && world->day == 1) &&
            organism->state == ALIFE_STATE_AWAKE &&
-           organism->age >= world->config.maturity_age &&
+           organism->biological_age / ALIFE_BIOLOGICAL_AGE_SCALE >=
+               world->config.maturity_age &&
            organism->reproduction_output > 0.0F &&
            organism->acceptance_output > 0.0F;
 }
@@ -856,9 +916,9 @@ static void record_attempt(AlifeWorld *world, AlifeOrganism *first,
     }
 }
 
-bool alife_try_birth(AlifeWorld *world, uint64_t parent_a_id,
-                     uint64_t parent_b_id, bool opportunity_granted,
-                     char *error, size_t error_size) {
+static bool complete_birth(AlifeWorld *world, uint64_t parent_a_id,
+                           uint64_t parent_b_id, char *error,
+                           size_t error_size) {
     size_t first_index;
     size_t second_index;
     AlifeOrganism *first;
@@ -879,7 +939,6 @@ bool alife_try_birth(AlifeWorld *world, uint64_t parent_a_id,
     second_index = find_index(world, parent_b_id);
     first = first_index == SIZE_MAX ? NULL : &world->organisms[first_index];
     second = second_index == SIZE_MAX ? NULL : &world->organisms[second_index];
-    record_attempt(world, first, second);
     if (parent_a_id == parent_b_id) {
         alife_log_reproduction(world, parent_a_id, parent_b_id, false,
                                "parents_not_distinct");
@@ -890,12 +949,6 @@ bool alife_try_birth(AlifeWorld *world, uint64_t parent_a_id,
         alife_log_reproduction(world, parent_a_id, parent_b_id, false,
                                "parent_not_living");
         alife_set_error(error, error_size, "Both parents must be living organisms.");
-        return false;
-    }
-    if (!opportunity_granted) {
-        alife_log_reproduction(world, parent_a_id, parent_b_id, false,
-                               "opportunity_not_granted");
-        alife_set_error(error, error_size, "The substrate did not grant an opportunity.");
         return false;
     }
     if (!alife_reproduction_eligible(world, first) ||
@@ -965,14 +1018,62 @@ bool alife_try_birth(AlifeWorld *world, uint64_t parent_a_id,
     return true;
 }
 
+bool alife_try_birth(AlifeWorld *world, uint64_t parent_a_id,
+                     uint64_t parent_b_id, bool opportunity_granted,
+                     char *error, size_t error_size) {
+    AlifeOrganism *first;
+    AlifeOrganism *second;
+
+    if (world == NULL || !world->initialized) {
+        alife_set_error(error, error_size, "The world is not initialized.");
+        return false;
+    }
+    first = alife_find_organism_mut(world, parent_a_id);
+    second = alife_find_organism_mut(world, parent_b_id);
+    record_attempt(world, first, second);
+    if (parent_a_id == parent_b_id || first == NULL || second == NULL) {
+        alife_set_error(error, error_size,
+                        "Courtship requires two distinct living organisms.");
+        return false;
+    }
+    if (!opportunity_granted) {
+        alife_set_error(error, error_size,
+                        "The substrate did not grant an opportunity.");
+        return false;
+    }
+    if (first->courtship_partner_id != 0U ||
+        second->courtship_partner_id != 0U) {
+        alife_set_error(error, error_size,
+                        "Both organisms must be available for courtship.");
+        return false;
+    }
+    if (!alife_reproduction_eligible(world, first) ||
+        !alife_reproduction_eligible(world, second)) {
+        alife_set_error(error, error_size,
+                        "Both organisms must be mature and consenting.");
+        return false;
+    }
+    first->courtship_partner_id = second->id;
+    second->courtship_partner_id = first->id;
+    first->courtship_progress = 0U;
+    second->courtship_progress = 0U;
+    ++world->active_courtships;
+    ++world->courtships_started;
+    alife_log_courtship(world, "courtship_started", first->id, second->id,
+                        0U, "started");
+    return true;
+}
+
 void alife_enforce_capacity(AlifeWorld *world) {
     while (world != NULL && world->count > 0U &&
            world->population_bytes > world->config.capacity_bytes) {
         size_t oldest = 0U;
         size_t i;
         for (i = 1U; i < world->count; ++i) {
-            if (world->organisms[i].age > world->organisms[oldest].age ||
-                (world->organisms[i].age == world->organisms[oldest].age &&
+            if (world->organisms[i].chronological_age >
+                    world->organisms[oldest].chronological_age ||
+                (world->organisms[i].chronological_age ==
+                     world->organisms[oldest].chronological_age &&
                  world->organisms[i].id < world->organisms[oldest].id)) {
                 oldest = i;
             }
@@ -992,12 +1093,18 @@ static void build_inputs(const AlifeWorld *world, size_t index, float *inputs) {
     double day_fraction = ((double)(world->month - 1) * 31.0 +
                            (double)(world->day - 1)) / 372.0;
 
-    for (i = 0U; i < input_size + communication; ++i) {
+    for (i = 0U; i < input_size + communication +
+                    ALIFE_PRIVATE_COURTSHIP_INPUTS; ++i) {
         inputs[i] = 0.0F;
     }
-    inputs[0] = (float)clamp_double((double)organism->age / scale, 0.0, 1.0);
-    inputs[1] = (float)clamp_double((double)organism->reward / scale, 0.0, 1.0);
-    inputs[2] = organism->age >= world->config.maturity_age ? 1.0F : 0.0F;
+    inputs[0] = (float)clamp_double(
+        ((double)organism->biological_age /
+         (double)ALIFE_BIOLOGICAL_AGE_SCALE) / scale, 0.0, 1.0);
+    inputs[1] = (float)clamp_double(
+        ((double)organism->reward / (double)ALIFE_BIOLOGICAL_AGE_SCALE) /
+        scale, 0.0, 1.0);
+    inputs[2] = organism->biological_age / ALIFE_BIOLOGICAL_AGE_SCALE >=
+                world->config.maturity_age ? 1.0F : 0.0F;
     inputs[3] = (float)alife_reproduction_probability(world, organism);
     inputs[4] = world->config.capacity_bytes == 0U ? 0.0F :
         (float)((double)world->population_bytes /
@@ -1012,12 +1119,14 @@ static void build_inputs(const AlifeWorld *world, size_t index, float *inputs) {
     for (i = 0U; i < communication; ++i) {
         inputs[input_size + i] = slot[world->layout.inbox + i];
     }
+    inputs[input_size + communication] = organism->courtship_input;
 }
 
 static void execute_organism(AlifeWorld *world, size_t index, bool asleep) {
     size_t hidden = (size_t)world->config.hidden_size;
     size_t input_count = (size_t)world->config.input_size +
-                         (size_t)world->config.communication_size;
+                         (size_t)world->config.communication_size +
+                         ALIFE_PRIVATE_COURTSHIP_INPUTS;
     size_t communication = (size_t)world->config.communication_size;
     float inputs[ALIFE_MAX_INPUTS];
     float *slot = alife_slot(world, index);
@@ -1077,6 +1186,9 @@ static void execute_organism(AlifeWorld *world, size_t index, bool asleep) {
                     break;
                 case ALIFE_OUTPUT_OFF_DURATION:
                     world->organisms[index].off_duration_output = output;
+                    break;
+                case ALIFE_OUTPUT_COURTSHIP_SIGNAL:
+                    world->organisms[index].courtship_output = output;
                     break;
                 default:
                     break;
@@ -1158,6 +1270,71 @@ static void deliver_communication(AlifeWorld *world) {
     }
 }
 
+static void process_courtships(AlifeWorld *world) {
+    size_t i = 0U;
+    char ignored[128];
+
+    while (i < world->count) {
+        AlifeOrganism *first = &world->organisms[i];
+        AlifeOrganism *second;
+        uint64_t first_id;
+        uint64_t second_id;
+
+        if (first->courtship_partner_id == 0U ||
+            first->id > first->courtship_partner_id) {
+            ++i;
+            continue;
+        }
+        first_id = first->id;
+        second_id = first->courtship_partner_id;
+        second = alife_find_organism_mut(world, second_id);
+        if (second == NULL || second->courtship_partner_id != first_id) {
+            cancel_courtship(world, first_id, "ineligible");
+            ++i;
+            continue;
+        }
+        if (!alife_reproduction_eligible(world, first) ||
+            !alife_reproduction_eligible(world, second)) {
+            const char *reason =
+                first->state == ALIFE_STATE_ASLEEP ||
+                second->state == ALIFE_STATE_ASLEEP ? "sleep" :
+                first->state == ALIFE_STATE_OFF ||
+                second->state == ALIFE_STATE_OFF ? "off" :
+                first->reproduction_output <= 0.0F ||
+                first->acceptance_output <= 0.0F ||
+                second->reproduction_output <= 0.0F ||
+                second->acceptance_output <= 0.0F ?
+                "consent_withdrawn" : "ineligible";
+            cancel_courtship(world, first_id, reason);
+            ++i;
+            continue;
+        }
+        first->courtship_input = second->courtship_output;
+        second->courtship_input = first->courtship_output;
+        ++first->courtship_progress;
+        second->courtship_progress = first->courtship_progress;
+        if (first->courtship_progress >=
+            world->config.courtship_duration_ticks) {
+            uint64_t progress = first->courtship_progress;
+            first->courtship_partner_id = 0U;
+            first->courtship_progress = 0U;
+            first->courtship_input = 0.0F;
+            second->courtship_partner_id = 0U;
+            second->courtship_progress = 0U;
+            second->courtship_input = 0.0F;
+            --world->active_courtships;
+            ++world->courtships_completed;
+            alife_log_courtship(world, "courtship_completed", first_id,
+                                second_id, progress, "completed");
+            if (complete_birth(world, first_id, second_id, ignored,
+                               sizeof(ignored))) {
+                ++world->courtship_births;
+            }
+        }
+        ++i;
+    }
+}
+
 static void process_reproduction(AlifeWorld *world) {
     size_t candidates = 0U;
     size_t i;
@@ -1165,7 +1342,8 @@ static void process_reproduction(AlifeWorld *world) {
 
     for (i = 0U; i < world->count; ++i) {
         AlifeOrganism *organism = &world->organisms[i];
-        if (alife_reproduction_eligible(world, organism) &&
+        if (organism->courtship_partner_id == 0U &&
+            alife_reproduction_eligible(world, organism) &&
             alife_rng_unit(&world->rng) <
                 alife_reproduction_probability(world, organism)) {
             world->scratch_ids[candidates++] = organism->id;
@@ -1310,6 +1488,32 @@ static bool off_metadata_valid(const AlifeWorld *world, size_t index) {
            organism->back_on_tick > world->tick;
 }
 
+static uint64_t biological_increment(const AlifeWorld *world,
+                                     AlifeLifecycleState state) {
+    double rate = state == ALIFE_STATE_AWAKE ? world->config.awake_age_rate :
+                  state == ALIFE_STATE_ASLEEP ? world->config.sleep_age_rate :
+                  world->config.off_age_rate;
+
+    return (uint64_t)(rate * (double)ALIFE_BIOLOGICAL_AGE_SCALE + 0.5);
+}
+
+static void process_dormancy_timeouts(AlifeWorld *world) {
+    uint64_t limit = world->config.max_without_awake_days *
+                     world->config.ticks_per_day;
+    size_t i = 0U;
+
+    while (i < world->count) {
+        AlifeOrganism *organism = &world->organisms[i];
+        if (organism->state != ALIFE_STATE_AWAKE &&
+            world->tick > organism->last_awake_tick &&
+            world->tick - organism->last_awake_tick > limit) {
+            remove_at(world, i, ALIFE_DEATH_DORMANCY_TIMEOUT);
+        } else {
+            ++i;
+        }
+    }
+}
+
 bool alife_world_step(AlifeWorld *world, char *error, size_t error_size) {
     size_t i;
     uint64_t first_new_id;
@@ -1336,6 +1540,7 @@ bool alife_world_step(AlifeWorld *world, char *error, size_t error_size) {
     }
     process_off_timers(world);
     process_foolsday(world);
+    process_dormancy_timeouts(world);
 
     i = 0U;
     while (i < world->count) {
@@ -1360,6 +1565,7 @@ bool alife_world_step(AlifeWorld *world, char *error, size_t error_size) {
         }
     }
     deliver_communication(world);
+    process_courtships(world);
     first_new_id = world->next_id;
     process_reproduction(world);
     alife_enforce_capacity(world);
@@ -1367,12 +1573,19 @@ bool alife_world_step(AlifeWorld *world, char *error, size_t error_size) {
         if (world->organisms[i].id < first_new_id) {
             AlifeRewardContext reward_context;
             reward_context.tick = world->tick;
-            reward_context.age = world->organisms[i].age;
+            uint64_t increment = biological_increment(
+                world, world->organisms[i].state);
+            reward_context.age = world->organisms[i].biological_age;
+            reward_context.biological_age_increment = increment;
             reward_context.accumulated_reward = world->organisms[i].reward;
             reward_context.survived_tick = true;
             world->organisms[i].reward +=
                 alife_reward_calculate(&reward_context);
-            ++world->organisms[i].age;
+            ++world->organisms[i].chronological_age;
+            world->organisms[i].biological_age += increment;
+            if (world->organisms[i].state == ALIFE_STATE_AWAKE) {
+                world->organisms[i].last_awake_tick = world->tick;
+            }
         }
     }
     ++world->tick;

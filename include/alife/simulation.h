@@ -9,11 +9,13 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define ALIFE_CHECKPOINT_VERSION 3U
+#define ALIFE_CHECKPOINT_VERSION 4U
+#define ALIFE_BIOLOGICAL_AGE_SCALE UINT64_C(1000000)
 #define ALIFE_MIN_GENOME_PARAMETERS 500U
 #define ALIFE_MAX_GENOME_PARAMETERS 2000U
 #define ALIFE_PRIVATE_CONTROL_OUTPUTS 4U
-#define ALIFE_NONCOMMUNICATION_OUTPUTS 6U
+#define ALIFE_NONCOMMUNICATION_OUTPUTS 7U
+#define ALIFE_PRIVATE_COURTSHIP_INPUTS 1U
 
 typedef enum {
     ALIFE_STATE_AWAKE = 0,
@@ -27,7 +29,8 @@ typedef enum {
     ALIFE_OUTPUT_SLEEP = 2,
     ALIFE_OUTPUT_WAKE = 3,
     ALIFE_OUTPUT_OFF = 4,
-    ALIFE_OUTPUT_OFF_DURATION = 5
+    ALIFE_OUTPUT_OFF_DURATION = 5,
+    ALIFE_OUTPUT_COURTSHIP_SIGNAL = 6
 } AlifeOutputOffset;
 
 typedef enum {
@@ -35,7 +38,8 @@ typedef enum {
     ALIFE_DEATH_FOOLSDAY_AWAKE = 1,
     ALIFE_DEATH_FOOLSDAY_SLEEP = 2,
     ALIFE_DEATH_INVALID_STATE = 3,
-    ALIFE_DEATH_SHUTDOWN = 4
+    ALIFE_DEATH_SHUTDOWN = 4,
+    ALIFE_DEATH_DORMANCY_TIMEOUT = 5
 } AlifeDeathCause;
 
 typedef struct {
@@ -61,7 +65,11 @@ typedef struct {
     uint64_t parent_a;
     uint64_t parent_b;
     uint64_t birth_tick;
-    uint64_t age;
+    union {
+        uint64_t chronological_age;
+        uint64_t age; /* Deprecated compatibility name. */
+    };
+    uint64_t biological_age;
     uint64_t reward;
     uint64_t generation;
     uint64_t reproduction_attempts;
@@ -74,6 +82,9 @@ typedef struct {
     int32_t birth_day;
     AlifeLifecycleState state;
     uint64_t back_on_tick;
+    uint64_t last_awake_tick;
+    uint64_t courtship_partner_id;
+    uint64_t courtship_progress;
     int32_t last_foolsday_roll_year;
     float reproduction_output;
     float acceptance_output;
@@ -81,6 +92,8 @@ typedef struct {
     float wake_output;
     float off_output;
     float off_duration_output;
+    float courtship_output;
+    float courtship_input;
     bool sent_message_this_tick;
 } AlifeOrganism;
 
@@ -107,6 +120,11 @@ typedef struct {
     uint64_t awake_to_asleep_transitions;
     uint64_t asleep_to_awake_transitions;
     uint64_t asleep_to_off_transitions;
+    uint64_t active_courtships;
+    uint64_t courtships_started;
+    uint64_t courtships_failed;
+    uint64_t courtships_completed;
+    uint64_t courtship_births;
     uint64_t population_bytes;
     int32_t year;
     int32_t month;

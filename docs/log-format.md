@@ -12,8 +12,9 @@ The configured logging level controls volume:
 - `error` writes only diagnostics to standard error.
 - `summary` writes births, deaths, Fool's Day rolls, checkpoints, periodic
   summaries, and run-boundary records.
-- `events` adds state transitions, reproduction attempts, and sampled
-  plasticity records.
+- `events` adds state transitions, reproduction attempts, sampled plasticity
+  records, and courtship start, failure, and completion records. Courtship
+  records include partner IDs and progress.
 
 ## Common fields
 

@@ -20,6 +20,9 @@ void alife_log_birth(AlifeWorld *world, const AlifeOrganism *organism);
 void alife_log_reproduction(AlifeWorld *world, uint64_t parent_a,
                             uint64_t parent_b, bool approved,
                             const char *reason);
+void alife_log_courtship(AlifeWorld *world, const char *event,
+                         uint64_t first, uint64_t second,
+                         uint64_t progress, const char *reason);
 void alife_log_death(AlifeWorld *world, const AlifeOrganism *organism,
                      AlifeDeathCause cause);
 void alife_log_plasticity(AlifeWorld *world, const AlifeOrganism *organism,

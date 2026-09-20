@@ -18,7 +18,8 @@ organisms remain viable and evolve when age is the only explicit reward?
   inputs.
 - A small communication vector delivered by the host.
 - Bounded Hebbian changes to recurrent weights while an organism sleeps.
-- Sexual reproduction through per-gene recombination and bounded mutation.
+- Sexual reproduction after sustained, exclusive neural courtship, followed by
+  per-gene recombination and bounded mutation.
 - A byte-based ecosystem capacity instead of a fixed population count.
 - An evolvable `AWAKE`, `ASLEEP`, and `OFF` lifecycle that determines how an
   organism interacts, adapts internally, and survives April 1.
@@ -59,8 +60,12 @@ or environmental inputs, which allows an internal phase to request waking.
 Only off duration remains substrate-scheduled after a sleeping network requests
 off.
 
-Age and survived-age reward advance in every state. Sleeping and off organisms
-also continue to consume capacity and can be displaced as the oldest organism.
+Chronological age advances in every state. Biological age and survived-age
+reward use state-specific rates, so sleeping and off organisms age more slowly.
+Capacity eviction still uses chronological age. An organism that remains
+continuously asleep or off beyond `max_without_awake_days` dies. Sleeping and
+off organisms also continue to consume capacity and can be displaced as the
+oldest organism.
 Seeds and offspring begin awake.
 
 On April 1, awake organisms die immediately. Sleeping organisms receive one
@@ -145,8 +150,13 @@ calibration guidance.
 | `communication_size` | Message input and output width from 1 through 8. |
 | `initial_population` | Number of related seed organisms; version 1 requires `2`. |
 | `capacity_bytes` | Maximum total byte cost of living organisms after capacity enforcement. |
-| `maturity_age` | Minimum age in ticks for reproduction. |
-| `reproduction_ramp_ticks` | Ticks over which opportunity rises after maturity. |
+| `maturity_age` | Minimum biological age in ticks for reproduction. |
+| `reproduction_ramp_ticks` | Biological-age ticks over which opportunity rises after maturity. |
+| `courtship_duration_ticks` | Consecutive consenting awake ticks required for birth. |
+| `awake_age_rate` | Biological-age ticks added per awake simulation tick. |
+| `sleep_age_rate` | Biological-age ticks added per sleeping simulation tick. |
+| `off_age_rate` | Biological-age ticks added per off simulation tick. |
+| `max_without_awake_days` | Maximum consecutive simulated days without an awake tick. |
 | `reproduction_base_probability` | Opportunity probability at maturity. |
 | `reproduction_max_probability` | Maximum opportunity probability at the end of the ramp. |
 | `mutation_probability` | Independent probability of mutating a recombined gene. |

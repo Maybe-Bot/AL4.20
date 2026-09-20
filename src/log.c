@@ -67,6 +67,8 @@ const char *alife_death_cause_name(AlifeDeathCause cause) {
             return "invalid_state";
         case ALIFE_DEATH_SHUTDOWN:
             return "shutdown";
+        case ALIFE_DEATH_DORMANCY_TIMEOUT:
+            return "dormancy_timeout";
     }
     return "unknown";
 }
@@ -128,6 +130,20 @@ void alife_log_reproduction(AlifeWorld *world, uint64_t parent_a,
                   parent_a, parent_b, approved ? "true" : "false", reason);
 }
 
+void alife_log_courtship(AlifeWorld *world, const char *event,
+                         uint64_t first, uint64_t second,
+                         uint64_t progress, const char *reason) {
+    if (world == NULL || world->event_log == NULL ||
+        world->config.logging_level < ALIFE_LOG_EVENTS) {
+        return;
+    }
+    event_prefix(world, event);
+    (void)fprintf(world->event_log,
+                  ",\"partner_a\":%" PRIu64 ",\"partner_b\":%" PRIu64
+                  ",\"progress\":%" PRIu64 ",\"reason\":\"%s\"}\n",
+                  first, second, progress, reason);
+}
+
 void alife_log_death(AlifeWorld *world, const AlifeOrganism *organism,
                      AlifeDeathCause cause) {
     if (!summaries_enabled(world)) {
@@ -136,14 +152,19 @@ void alife_log_death(AlifeWorld *world, const AlifeOrganism *organism,
     event_prefix(world, "death");
     (void)fprintf(world->event_log,
                   ",\"organism_id\":%" PRIu64 ",\"cause\":\"%s\""
-                  ",\"birth_tick\":%" PRIu64 ",\"age\":%" PRIu64
+                  ",\"birth_tick\":%" PRIu64
+                  ",\"chronological_age\":%" PRIu64
+                  ",\"biological_age\":%.6f"
                   ",\"reward\":%" PRIu64 ",\"generation\":%" PRIu64
                   ",\"reproduction_attempts\":%" PRIu64
                   ",\"successful_reproduction\":%" PRIu64
                   ",\"mutations\":%" PRIu64
                   ",\"significant_weight_changes\":%" PRIu64 "}\n",
                   organism->id, alife_death_cause_name(cause),
-                  organism->birth_tick, organism->age, organism->reward,
+                  organism->birth_tick, organism->chronological_age,
+                  (double)organism->biological_age /
+                      (double)ALIFE_BIOLOGICAL_AGE_SCALE,
+                  organism->reward,
                   organism->generation, organism->reproduction_attempts,
                   organism->successful_reproductions, organism->mutations,
                   organism->significant_weight_changes);
@@ -188,6 +209,10 @@ void alife_log_summary(AlifeWorld *world) {
                       " transitions=%" PRIu64 " awake_to_asleep=%" PRIu64
                       " asleep_to_awake=%" PRIu64
                       " asleep_to_off=%" PRIu64
+                      " courtships_active=%" PRIu64
+                      " courtships_started=%" PRIu64
+                      " courtships_failed=%" PRIu64
+                      " courtships_completed=%" PRIu64
                       " births=%" PRIu64 " deaths=%" PRIu64 "\n",
                       world->tick, world->year, world->month, world->day,
                       world->count, world->population_bytes,
@@ -197,6 +222,10 @@ void alife_log_summary(AlifeWorld *world) {
                       world->awake_to_asleep_transitions,
                       world->asleep_to_awake_transitions,
                       world->asleep_to_off_transitions,
+                      world->active_courtships,
+                      world->courtships_started,
+                      world->courtships_failed,
+                      world->courtships_completed,
                       world->total_births, world->total_deaths);
     }
     if (!summaries_enabled(world)) {
@@ -211,6 +240,10 @@ void alife_log_summary(AlifeWorld *world) {
                   ",\"awake_to_asleep\":%" PRIu64
                   ",\"asleep_to_awake\":%" PRIu64
                   ",\"asleep_to_off\":%" PRIu64
+                  ",\"courtships_active\":%" PRIu64
+                  ",\"courtships_started\":%" PRIu64
+                  ",\"courtships_failed\":%" PRIu64
+                  ",\"courtships_completed\":%" PRIu64
                   ",\"births\":%" PRIu64 ",\"deaths\":%" PRIu64
                   ",\"reproduction_attempts\":%" PRIu64
                   ",\"mutations\":%" PRIu64 "}\n",
@@ -221,6 +254,10 @@ void alife_log_summary(AlifeWorld *world) {
                   world->awake_to_asleep_transitions,
                   world->asleep_to_awake_transitions,
                   world->asleep_to_off_transitions,
+                  world->active_courtships,
+                  world->courtships_started,
+                  world->courtships_failed,
+                  world->courtships_completed,
                   world->total_births,
                   world->total_deaths, world->total_reproduction_attempts,
                   world->total_mutations);

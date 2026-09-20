@@ -29,6 +29,11 @@ typedef struct {
     uint64_t capacity_bytes;
     uint64_t maturity_age;
     uint64_t reproduction_ramp_ticks;
+    uint64_t courtship_duration_ticks;
+    double awake_age_rate;
+    double sleep_age_rate;
+    double off_age_rate;
+    uint64_t max_without_awake_days;
     double reproduction_base_probability;
     double reproduction_max_probability;
     double mutation_probability;

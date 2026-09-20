@@ -19,6 +19,11 @@ typedef enum {
     KEY_CAPACITY_BYTES,
     KEY_MATURITY_AGE,
     KEY_REPRODUCTION_RAMP_TICKS,
+    KEY_COURTSHIP_DURATION_TICKS,
+    KEY_AWAKE_AGE_RATE,
+    KEY_SLEEP_AGE_RATE,
+    KEY_OFF_AGE_RATE,
+    KEY_MAX_WITHOUT_AWAKE_DAYS,
     KEY_REPRODUCTION_BASE_PROBABILITY,
     KEY_REPRODUCTION_MAX_PROBABILITY,
     KEY_MUTATION_PROBABILITY,
@@ -57,6 +62,11 @@ static const KeyDefinition KEY_DEFINITIONS[] = {
     {"capacity_bytes", KEY_CAPACITY_BYTES},
     {"maturity_age", KEY_MATURITY_AGE},
     {"reproduction_ramp_ticks", KEY_REPRODUCTION_RAMP_TICKS},
+    {"courtship_duration_ticks", KEY_COURTSHIP_DURATION_TICKS},
+    {"awake_age_rate", KEY_AWAKE_AGE_RATE},
+    {"sleep_age_rate", KEY_SLEEP_AGE_RATE},
+    {"off_age_rate", KEY_OFF_AGE_RATE},
+    {"max_without_awake_days", KEY_MAX_WITHOUT_AWAKE_DAYS},
     {"reproduction_base_probability", KEY_REPRODUCTION_BASE_PROBABILITY},
     {"reproduction_max_probability", KEY_REPRODUCTION_MAX_PROBABILITY},
     {"mutation_probability", KEY_MUTATION_PROBABILITY},
@@ -235,6 +245,21 @@ static bool assign_value(AlifeConfig *config, const ConfigKey key,
         case KEY_REPRODUCTION_RAMP_TICKS:
             valid = parse_u64(value, &config->reproduction_ramp_ticks);
             break;
+        case KEY_COURTSHIP_DURATION_TICKS:
+            valid = parse_u64(value, &config->courtship_duration_ticks);
+            break;
+        case KEY_AWAKE_AGE_RATE:
+            valid = parse_double_value(value, &config->awake_age_rate);
+            break;
+        case KEY_SLEEP_AGE_RATE:
+            valid = parse_double_value(value, &config->sleep_age_rate);
+            break;
+        case KEY_OFF_AGE_RATE:
+            valid = parse_double_value(value, &config->off_age_rate);
+            break;
+        case KEY_MAX_WITHOUT_AWAKE_DAYS:
+            valid = parse_u64(value, &config->max_without_awake_days);
+            break;
         case KEY_REPRODUCTION_BASE_PROBABILITY:
             valid = parse_double_value(
                 value, &config->reproduction_base_probability);
@@ -406,6 +431,11 @@ void alife_config_defaults(AlifeConfig *config) {
     config->capacity_bytes = UINT64_C(67108864);
     config->maturity_age = UINT64_C(1000);
     config->reproduction_ramp_ticks = UINT64_C(9000);
+    config->courtship_duration_ticks = UINT64_C(20);
+    config->awake_age_rate = 1.0;
+    config->sleep_age_rate = 0.6;
+    config->off_age_rate = 0.02;
+    config->max_without_awake_days = UINT64_C(7);
     config->reproduction_base_probability = 0.01;
     config->reproduction_max_probability = 0.50;
     config->mutation_probability = 0.01;
@@ -456,12 +486,12 @@ bool alife_config_validate(const AlifeConfig *config, char *error,
     parameter_count =
         (uint64_t)config->hidden_size *
             ((uint64_t)config->input_size +
-             (uint64_t)config->communication_size) +
+             (uint64_t)config->communication_size + UINT64_C(1)) +
         (uint64_t)config->hidden_size * (uint64_t)config->hidden_size +
         (uint64_t)config->hidden_size +
-        ((uint64_t)config->communication_size + UINT64_C(6)) *
+        ((uint64_t)config->communication_size + UINT64_C(7)) *
             (uint64_t)config->hidden_size +
-        ((uint64_t)config->communication_size + UINT64_C(6)) +
+        ((uint64_t)config->communication_size + UINT64_C(7)) +
         UINT64_C(2) * (uint64_t)config->hidden_size;
     if (parameter_count < UINT64_C(500) ||
         parameter_count > UINT64_C(2000)) {
@@ -486,6 +516,27 @@ bool alife_config_validate(const AlifeConfig *config, char *error,
         return set_error(
             error, error_size,
             "reproduction_ramp_ticks must be greater than zero");
+    }
+    if (config->courtship_duration_ticks == 0U) {
+        return set_error(error, error_size,
+                         "courtship_duration_ticks must be greater than zero");
+    }
+    if (!isfinite(config->awake_age_rate) || config->awake_age_rate < 0.0 ||
+        !isfinite(config->sleep_age_rate) || config->sleep_age_rate < 0.0 ||
+        !isfinite(config->off_age_rate) || config->off_age_rate < 0.0) {
+        return set_error(error, error_size,
+                         "age rates must be finite and nonnegative");
+    }
+    if (config->awake_age_rate > (double)UINT64_MAX / 1000000.0 ||
+        config->sleep_age_rate > (double)UINT64_MAX / 1000000.0 ||
+        config->off_age_rate > (double)UINT64_MAX / 1000000.0) {
+        return set_error(error, error_size, "age rates are too large");
+    }
+    if (config->max_without_awake_days == 0U ||
+        (config->ticks_per_day != 0U &&
+         config->max_without_awake_days > UINT64_MAX / config->ticks_per_day)) {
+        return set_error(error, error_size,
+                         "max_without_awake_days must be positive and representable");
     }
     if (config->reproduction_ramp_ticks == UINT64_MAX ||
         config->maturity_age >
@@ -768,6 +819,11 @@ bool alife_config_equal(const AlifeConfig *left, const AlifeConfig *right) {
            left->capacity_bytes == right->capacity_bytes &&
            left->maturity_age == right->maturity_age &&
            left->reproduction_ramp_ticks == right->reproduction_ramp_ticks &&
+           left->courtship_duration_ticks == right->courtship_duration_ticks &&
+           left->awake_age_rate == right->awake_age_rate &&
+           left->sleep_age_rate == right->sleep_age_rate &&
+           left->off_age_rate == right->off_age_rate &&
+           left->max_without_awake_days == right->max_without_awake_days &&
            left->reproduction_base_probability ==
                right->reproduction_base_probability &&
            left->reproduction_max_probability ==
@@ -812,6 +868,11 @@ uint64_t alife_config_fingerprint(const AlifeConfig *config) {
     hash = fingerprint_u64(hash, config->capacity_bytes);
     hash = fingerprint_u64(hash, config->maturity_age);
     hash = fingerprint_u64(hash, config->reproduction_ramp_ticks);
+    hash = fingerprint_u64(hash, config->courtship_duration_ticks);
+    hash = fingerprint_double(hash, config->awake_age_rate);
+    hash = fingerprint_double(hash, config->sleep_age_rate);
+    hash = fingerprint_double(hash, config->off_age_rate);
+    hash = fingerprint_u64(hash, config->max_without_awake_days);
     hash = fingerprint_double(hash, config->reproduction_base_probability);
     hash = fingerprint_double(hash, config->reproduction_max_probability);
     hash = fingerprint_double(hash, config->mutation_probability);

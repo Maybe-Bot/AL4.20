@@ -73,6 +73,28 @@ static void make_reproduction_request(AlifeWorld *world, const uint64_t id)
     }
 }
 
+static void force_reproduction_consent(AlifeWorld *world, const uint64_t id)
+{
+    float *genome = alife_organism_genome_mut(world, id);
+    size_t hidden = (size_t)world->config.hidden_size;
+    size_t communication = (size_t)world->config.communication_size;
+    size_t output;
+    size_t hidden_index;
+
+    if (genome == NULL) {
+        return;
+    }
+    for (output = communication + ALIFE_OUTPUT_REPRODUCTION;
+         output <= communication + ALIFE_OUTPUT_ACCEPTANCE; ++output) {
+        genome[world->layout.output_biases + output] = 4.0F;
+        for (hidden_index = 0U; hidden_index < hidden; ++hidden_index) {
+            genome[world->layout.output_weights + output * hidden +
+                   hidden_index] = 0.0F;
+        }
+    }
+    make_reproduction_request(world, id);
+}
+
 static void set_controls(AlifeWorld *world, const uint64_t id,
                          const float sleep_value, const float wake_value,
                          const float off_value, const float duration_value)
@@ -204,7 +226,8 @@ static enum test_result test_reproduction_requires_distinct_parents(void)
     prepare_config(&config);
     EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)), error);
     parent_id = world.organisms[0].id;
-    world.organisms[0].age = config.maturity_age;
+    world.organisms[0].biological_age =
+        config.maturity_age * ALIFE_BIOLOGICAL_AGE_SCALE;
     make_reproduction_request(&world, parent_id);
 
     EXPECT_TRUE(!alife_try_birth(&world, parent_id, parent_id, true, error,
@@ -230,7 +253,8 @@ static enum test_result test_single_parent_cannot_create_offspring(void)
     EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)), error);
     parent_id = world.organisms[0].id;
     missing_id = world.next_id + UINT64_C(1000);
-    world.organisms[0].age = config.maturity_age;
+    world.organisms[0].biological_age =
+        config.maturity_age * ALIFE_BIOLOGICAL_AGE_SCALE;
     make_reproduction_request(&world, parent_id);
 
     EXPECT_TRUE(!alife_try_birth(&world, parent_id, missing_id, true, error,
@@ -263,14 +287,21 @@ static enum test_result test_offspring_respects_neural_size_limits(void)
 
     parent_a = world.organisms[0].id;
     parent_b = world.organisms[1].id;
-    world.organisms[0].age = config.maturity_age;
-    world.organisms[1].age = config.maturity_age;
-    make_reproduction_request(&world, parent_a);
-    make_reproduction_request(&world, parent_b);
+    world.organisms[0].biological_age =
+        config.maturity_age * ALIFE_BIOLOGICAL_AGE_SCALE;
+    world.organisms[1].biological_age =
+        config.maturity_age * ALIFE_BIOLOGICAL_AGE_SCALE;
+    config.courtship_duration_ticks = 1U;
+    world.config.courtship_duration_ticks = 1U;
+    force_reproduction_consent(&world, parent_a);
+    force_reproduction_consent(&world, parent_b);
+    set_controls(&world, parent_a, -4.0F, -4.0F, -4.0F, -1.0F);
+    set_controls(&world, parent_b, -4.0F, -4.0F, -4.0F, -1.0F);
     child_id = world.next_id;
     EXPECT_CALL(alife_try_birth(&world, parent_a, parent_b, true, error,
-                                sizeof(error)),
+                sizeof(error)),
                 error);
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
     EXPECT_TRUE(world.count == 3U);
     child_genome = alife_organism_genome(&world, child_id);
     EXPECT_TRUE(child_genome != NULL);
@@ -337,14 +368,22 @@ static enum test_result test_initial_and_offspring_states_are_awake(void)
     EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)), error);
     EXPECT_TRUE(world.organisms[0].state == ALIFE_STATE_AWAKE);
     EXPECT_TRUE(world.organisms[1].state == ALIFE_STATE_AWAKE);
-    world.organisms[0].age = config.maturity_age;
-    world.organisms[1].age = config.maturity_age;
-    make_reproduction_request(&world, world.organisms[0].id);
-    make_reproduction_request(&world, world.organisms[1].id);
+    world.organisms[0].biological_age =
+        config.maturity_age * ALIFE_BIOLOGICAL_AGE_SCALE;
+    world.organisms[1].biological_age =
+        config.maturity_age * ALIFE_BIOLOGICAL_AGE_SCALE;
+    world.config.courtship_duration_ticks = 1U;
+    force_reproduction_consent(&world, world.organisms[0].id);
+    force_reproduction_consent(&world, world.organisms[1].id);
+    set_controls(&world, world.organisms[0].id,
+                 -4.0F, -4.0F, -4.0F, -1.0F);
+    set_controls(&world, world.organisms[1].id,
+                 -4.0F, -4.0F, -4.0F, -1.0F);
     child_id = world.next_id;
     EXPECT_CALL(alife_try_birth(&world, world.organisms[0].id,
                                 world.organisms[1].id, true, error,
                                 sizeof(error)), error);
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
     EXPECT_TRUE(alife_find_organism(&world, child_id)->state == ALIFE_STATE_AWAKE);
 
 cleanup:
@@ -585,7 +624,8 @@ static enum test_result test_sleep_and_off_disable_external_behavior(void)
     inactive_slot[world.layout.outbox] = 1.0F;
     world.organisms[0].sent_message_this_tick = true;
     make_reproduction_request(&world, inactive_id);
-    world.organisms[0].age = config.maturity_age;
+    world.organisms[0].biological_age =
+        config.maturity_age * ALIFE_BIOLOGICAL_AGE_SCALE;
     EXPECT_TRUE(!alife_reproduction_eligible(&world, &world.organisms[0]));
     EXPECT_TRUE(!alife_try_birth(&world, inactive_id, awake_id, true, error,
                                  sizeof(error)));
@@ -820,7 +860,8 @@ static enum test_result test_age_and_reward_advance_in_all_states(void)
                                          sizeof(error)), error);
     EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
     EXPECT_TRUE(alife_find_organism(&world, inactive_id)->age == UINT64_C(2));
-    EXPECT_TRUE(alife_find_organism(&world, inactive_id)->reward == UINT64_C(2));
+    EXPECT_TRUE(alife_find_organism(&world, inactive_id)->reward ==
+                UINT64_C(620000));
 
 cleanup:
     alife_world_destroy(&world);
@@ -874,8 +915,10 @@ static enum test_result test_pair_requires_consent_and_opportunity(void)
     EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)), error);
     parent_a = world.organisms[0].id;
     parent_b = world.organisms[1].id;
-    world.organisms[0].age = config.maturity_age;
-    world.organisms[1].age = config.maturity_age;
+    world.organisms[0].biological_age =
+        config.maturity_age * ALIFE_BIOLOGICAL_AGE_SCALE;
+    world.organisms[1].biological_age =
+        config.maturity_age * ALIFE_BIOLOGICAL_AGE_SCALE;
     make_reproduction_request(&world, parent_a);
     world.organisms[1].reproduction_output = 1.0F;
     world.organisms[1].acceptance_output = 0.0F;
@@ -887,6 +930,82 @@ static enum test_result test_pair_requires_consent_and_opportunity(void)
     EXPECT_TRUE(!alife_try_birth(&world, parent_a, parent_b, false, error,
                                  sizeof(error)));
     EXPECT_TRUE(world.count == 2U);
+
+cleanup:
+    alife_world_destroy(&world);
+    return test_result_value;
+}
+
+static enum test_result test_courtship_is_exclusive_and_sustained(void)
+{
+    enum test_result test_result_value = TEST_PASS;
+    AlifeConfig config;
+    AlifeWorld world = {0};
+    char error[TEST_ERROR_SIZE] = {0};
+    uint64_t first;
+    uint64_t second;
+    size_t step;
+
+    prepare_config(&config);
+    config.courtship_duration_ticks = 3U;
+    EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)), error);
+    first = world.organisms[0].id;
+    second = world.organisms[1].id;
+    world.organisms[0].biological_age =
+        config.maturity_age * ALIFE_BIOLOGICAL_AGE_SCALE;
+    world.organisms[1].biological_age =
+        config.maturity_age * ALIFE_BIOLOGICAL_AGE_SCALE;
+    force_reproduction_consent(&world, first);
+    force_reproduction_consent(&world, second);
+    set_controls(&world, first, -4.0F, -4.0F, -4.0F, -1.0F);
+    set_controls(&world, second, -4.0F, -4.0F, -4.0F, -1.0F);
+    EXPECT_CALL(alife_try_birth(&world, first, second, true, error,
+                                sizeof(error)), error);
+    EXPECT_TRUE(world.count == 2U);
+    EXPECT_TRUE(alife_find_organism(&world, first)->courtship_partner_id ==
+                second);
+    EXPECT_TRUE(alife_find_organism(&world, second)->courtship_partner_id ==
+                first);
+    EXPECT_TRUE(!alife_try_birth(&world, first, second, true, error,
+                                 sizeof(error)));
+    for (step = 0U; step < 2U; ++step) {
+        EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+        EXPECT_TRUE(world.count == 2U);
+    }
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+    EXPECT_TRUE(world.count == 3U);
+    EXPECT_TRUE(world.courtships_completed == 1U);
+    EXPECT_TRUE(world.courtship_births == 1U);
+    EXPECT_TRUE(alife_find_organism(&world, first)->courtship_partner_id == 0U);
+
+cleanup:
+    alife_world_destroy(&world);
+    return test_result_value;
+}
+
+static enum test_result test_biological_rates_and_dormancy_timeout(void)
+{
+    enum test_result test_result_value = TEST_PASS;
+    AlifeConfig config;
+    AlifeWorld world = {0};
+    char error[TEST_ERROR_SIZE] = {0};
+    uint64_t sleeper;
+
+    prepare_config(&config);
+    config.ticks_per_day = 1U;
+    config.max_without_awake_days = 1U;
+    EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)), error);
+    sleeper = world.organisms[0].id;
+    EXPECT_CALL(alife_transition_request(&world, sleeper, ALIFE_STATE_ASLEEP,
+                                         0U, error, sizeof(error)), error);
+    set_controls(&world, sleeper, -4.0F, -4.0F, -4.0F, -1.0F);
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+    EXPECT_TRUE(alife_find_organism(&world, sleeper)->chronological_age == 1U);
+    EXPECT_TRUE(alife_find_organism(&world, sleeper)->biological_age ==
+                UINT64_C(600000));
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+    EXPECT_TRUE(alife_find_organism(&world, sleeper) == NULL);
 
 cleanup:
     alife_world_destroy(&world);
@@ -982,15 +1101,21 @@ static enum test_result test_mutation_stays_within_bounds(void)
     EXPECT_TRUE(second_genome != NULL);
     (void)memcpy(second_genome, first_genome,
                  world.layout.genome_count * sizeof(*first_genome));
-    world.organisms[0].age = config.maturity_age;
-    world.organisms[1].age = config.maturity_age;
-    make_reproduction_request(&world, parent_a);
-    make_reproduction_request(&world, parent_b);
+    world.organisms[0].biological_age =
+        config.maturity_age * ALIFE_BIOLOGICAL_AGE_SCALE;
+    world.organisms[1].biological_age =
+        config.maturity_age * ALIFE_BIOLOGICAL_AGE_SCALE;
+    world.config.courtship_duration_ticks = 1U;
+    force_reproduction_consent(&world, parent_a);
+    force_reproduction_consent(&world, parent_b);
+    set_controls(&world, parent_a, -4.0F, -4.0F, -4.0F, -1.0F);
+    set_controls(&world, parent_b, -4.0F, -4.0F, -4.0F, -1.0F);
     child_id = world.next_id;
 
     EXPECT_CALL(alife_try_birth(&world, parent_a, parent_b, true, error,
                                 sizeof(error)),
                 error);
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
     child_genome = alife_organism_genome(&world, child_id);
     first_genome = alife_organism_genome_mut(&world, parent_a);
     EXPECT_TRUE(child_genome != NULL);
@@ -1215,6 +1340,10 @@ int main(void)
          test_age_and_reward_advance_in_all_states},
         {"pairing requires consent and opportunity",
          test_pair_requires_consent_and_opportunity},
+        {"courtship is exclusive and sustained",
+         test_courtship_is_exclusive_and_sustained},
+        {"biological rates and dormancy timeout are enforced",
+         test_biological_rates_and_dormancy_timeout},
         {"invalid neural values are rejected",
          test_invalid_neural_values_are_rejected},
         {"identical seeds are reproducible",

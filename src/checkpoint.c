@@ -65,6 +65,11 @@ static bool write_header(FILE *file, const AlifeWorld *world) {
         !write_u64(file, world->awake_to_asleep_transitions) ||
         !write_u64(file, world->asleep_to_awake_transitions) ||
         !write_u64(file, world->asleep_to_off_transitions) ||
+        !write_u64(file, world->active_courtships) ||
+        !write_u64(file, world->courtships_started) ||
+        !write_u64(file, world->courtships_failed) ||
+        !write_u64(file, world->courtships_completed) ||
+        !write_u64(file, world->courtship_births) ||
         !write_i32(file, world->year) ||
         !write_i32(file, world->month) ||
         !write_i32(file, world->day) ||
@@ -84,7 +89,8 @@ static bool write_organism(FILE *file, const AlifeOrganism *organism) {
            write_u64(file, organism->parent_a) &&
            write_u64(file, organism->parent_b) &&
            write_u64(file, organism->birth_tick) &&
-           write_u64(file, organism->age) &&
+           write_u64(file, organism->chronological_age) &&
+           write_u64(file, organism->biological_age) &&
            write_u64(file, organism->reward) &&
            write_u64(file, organism->generation) &&
            write_u64(file, organism->reproduction_attempts) &&
@@ -97,13 +103,18 @@ static bool write_organism(FILE *file, const AlifeOrganism *organism) {
            write_i32(file, organism->birth_day) &&
            write_u32(file, (uint32_t)organism->state) &&
            write_u64(file, organism->back_on_tick) &&
+           write_u64(file, organism->last_awake_tick) &&
+           write_u64(file, organism->courtship_partner_id) &&
+           write_u64(file, organism->courtship_progress) &&
            write_i32(file, organism->last_foolsday_roll_year) &&
            write_f32(file, organism->reproduction_output) &&
            write_f32(file, organism->acceptance_output) &&
            write_f32(file, organism->sleep_output) &&
            write_f32(file, organism->wake_output) &&
            write_f32(file, organism->off_output) &&
-           write_f32(file, organism->off_duration_output);
+           write_f32(file, organism->off_duration_output) &&
+           write_f32(file, organism->courtship_output) &&
+           write_f32(file, organism->courtship_input);
 }
 
 bool alife_world_save(AlifeWorld *world, const char *path,
@@ -139,6 +150,25 @@ bool alife_world_save(AlifeWorld *world, const char *path,
         if (!alife_organism_state_valid(world, i)) {
             alife_set_error(error, error_size,
                             "The world contains invalid organism state.");
+            return false;
+        }
+        if (world->organisms[i].courtship_partner_id != 0U) {
+            const AlifeOrganism *partner = alife_find_organism(
+                world, world->organisms[i].courtship_partner_id);
+            if (partner == NULL || partner == &world->organisms[i] ||
+                partner->courtship_partner_id != world->organisms[i].id ||
+                world->organisms[i].state != ALIFE_STATE_AWAKE ||
+                partner->state != ALIFE_STATE_AWAKE ||
+                partner->courtship_progress !=
+                    world->organisms[i].courtship_progress) {
+                alife_set_error(error, error_size,
+                                "The world contains invalid courtship state.");
+                return false;
+            }
+        } else if (world->organisms[i].courtship_progress != 0U ||
+                   world->organisms[i].courtship_input != 0.0F) {
+            alife_set_error(error, error_size,
+                            "The world contains invalid courtship state.");
             return false;
         }
     }
@@ -199,6 +229,11 @@ typedef struct {
     uint64_t awake_to_asleep;
     uint64_t asleep_to_awake;
     uint64_t asleep_to_off;
+    uint64_t active_courtships;
+    uint64_t courtships_started;
+    uint64_t courtships_failed;
+    uint64_t courtships_completed;
+    uint64_t courtship_births;
     int32_t year;
     int32_t month;
     int32_t day;
@@ -236,6 +271,11 @@ static bool read_header(FILE *file, CheckpointHeader *header,
         !read_u64(file, &header->awake_to_asleep) ||
         !read_u64(file, &header->asleep_to_awake) ||
         !read_u64(file, &header->asleep_to_off) ||
+        !read_u64(file, &header->active_courtships) ||
+        !read_u64(file, &header->courtships_started) ||
+        !read_u64(file, &header->courtships_failed) ||
+        !read_u64(file, &header->courtships_completed) ||
+        !read_u64(file, &header->courtship_births) ||
         !read_i32(file, &header->year) ||
         !read_i32(file, &header->month) ||
         !read_i32(file, &header->day) ||
@@ -272,7 +312,8 @@ static bool read_organism(FILE *file, AlifeOrganism *organism) {
            read_u64(file, &organism->parent_a) &&
            read_u64(file, &organism->parent_b) &&
            read_u64(file, &organism->birth_tick) &&
-           read_u64(file, &organism->age) &&
+           read_u64(file, &organism->chronological_age) &&
+           read_u64(file, &organism->biological_age) &&
            read_u64(file, &organism->reward) &&
            read_u64(file, &organism->generation) &&
            read_u64(file, &organism->reproduction_attempts) &&
@@ -285,13 +326,18 @@ static bool read_organism(FILE *file, AlifeOrganism *organism) {
            read_i32(file, &organism->birth_day) &&
            read_u32(file, &state) &&
            read_u64(file, &organism->back_on_tick) &&
+           read_u64(file, &organism->last_awake_tick) &&
+           read_u64(file, &organism->courtship_partner_id) &&
+           read_u64(file, &organism->courtship_progress) &&
            read_i32(file, &organism->last_foolsday_roll_year) &&
            read_f32(file, &organism->reproduction_output) &&
            read_f32(file, &organism->acceptance_output) &&
            read_f32(file, &organism->sleep_output) &&
            read_f32(file, &organism->wake_output) &&
            read_f32(file, &organism->off_output) &&
-           read_f32(file, &organism->off_duration_output);
+           read_f32(file, &organism->off_duration_output) &&
+           read_f32(file, &organism->courtship_output) &&
+           read_f32(file, &organism->courtship_input);
     if (okay) {
         organism->state = (AlifeLifecycleState)state;
     }
@@ -405,7 +451,7 @@ bool alife_world_load(AlifeWorld *world, const AlifeConfig *config,
                                    world->organisms[i].birth_day) ||
             world->organisms[i].id >= header.next_id ||
             world->organisms[i].birth_tick > header.tick ||
-            world->organisms[i].reward != world->organisms[i].age ||
+            world->organisms[i].reward != world->organisms[i].biological_age ||
             (world->organisms[i].state == ALIFE_STATE_OFF &&
              (world->organisms[i].back_on_tick <= header.tick ||
               world->organisms[i].back_on_tick >
@@ -450,6 +496,47 @@ bool alife_world_load(AlifeWorld *world, const AlifeConfig *config,
             }
         }
     }
+    {
+        uint64_t pairs = 0U;
+        for (i = 0U; i < world->count; ++i) {
+            AlifeOrganism *organism = &world->organisms[i];
+            AlifeOrganism *partner;
+            if (organism->courtship_partner_id == 0U) {
+                if (organism->courtship_progress != 0U ||
+                    organism->courtship_input != 0.0F) {
+                    alife_set_error(error, error_size,
+                                    "The checkpoint contains invalid courtship state.");
+                    (void)fclose(file);
+                    abandon_world(world);
+                    return false;
+                }
+                continue;
+            }
+            partner = alife_find_organism_mut(
+                world, organism->courtship_partner_id);
+            if (partner == NULL || partner == organism ||
+                partner->courtship_partner_id != organism->id ||
+                organism->state != ALIFE_STATE_AWAKE ||
+                partner->state != ALIFE_STATE_AWAKE ||
+                organism->courtship_progress != partner->courtship_progress) {
+                alife_set_error(error, error_size,
+                                "The checkpoint contains invalid courtship state.");
+                (void)fclose(file);
+                abandon_world(world);
+                return false;
+            }
+            if (organism->id < partner->id) {
+                ++pairs;
+            }
+        }
+        if (pairs != header.active_courtships) {
+            alife_set_error(error, error_size,
+                            "The checkpoint courtship count is inconsistent.");
+            (void)fclose(file);
+            abandon_world(world);
+            return false;
+        }
+    }
     trailing = fgetc(file);
     if (trailing != EOF || ferror(file) != 0) {
         alife_set_error(error, error_size, "The checkpoint has unexpected trailing data.");
@@ -469,6 +556,11 @@ bool alife_world_load(AlifeWorld *world, const AlifeConfig *config,
     world->awake_to_asleep_transitions = header.awake_to_asleep;
     world->asleep_to_awake_transitions = header.asleep_to_awake;
     world->asleep_to_off_transitions = header.asleep_to_off;
+    world->active_courtships = header.active_courtships;
+    world->courtships_started = header.courtships_started;
+    world->courtships_failed = header.courtships_failed;
+    world->courtships_completed = header.courtships_completed;
+    world->courtship_births = header.courtship_births;
     world->year = header.year;
     world->month = header.month;
     world->day = header.day;
@@ -551,6 +643,11 @@ uint64_t alife_world_hash(const AlifeWorld *world) {
     HASH_FIELD(hash, world, awake_to_asleep_transitions);
     HASH_FIELD(hash, world, asleep_to_awake_transitions);
     HASH_FIELD(hash, world, asleep_to_off_transitions);
+    HASH_FIELD(hash, world, active_courtships);
+    HASH_FIELD(hash, world, courtships_started);
+    HASH_FIELD(hash, world, courtships_failed);
+    HASH_FIELD(hash, world, courtships_completed);
+    HASH_FIELD(hash, world, courtship_births);
     HASH_FIELD(hash, world, year);
     HASH_FIELD(hash, world, month);
     HASH_FIELD(hash, world, day);
@@ -562,7 +659,8 @@ uint64_t alife_world_hash(const AlifeWorld *world) {
         HASH_FIELD(hash, organism, parent_a);
         HASH_FIELD(hash, organism, parent_b);
         HASH_FIELD(hash, organism, birth_tick);
-        HASH_FIELD(hash, organism, age);
+        HASH_FIELD(hash, organism, chronological_age);
+        HASH_FIELD(hash, organism, biological_age);
         HASH_FIELD(hash, organism, reward);
         HASH_FIELD(hash, organism, generation);
         HASH_FIELD(hash, organism, reproduction_attempts);
@@ -575,6 +673,9 @@ uint64_t alife_world_hash(const AlifeWorld *world) {
         HASH_FIELD(hash, organism, birth_day);
         HASH_FIELD(hash, organism, state);
         HASH_FIELD(hash, organism, back_on_tick);
+        HASH_FIELD(hash, organism, last_awake_tick);
+        HASH_FIELD(hash, organism, courtship_partner_id);
+        HASH_FIELD(hash, organism, courtship_progress);
         HASH_FIELD(hash, organism, last_foolsday_roll_year);
         HASH_FIELD(hash, organism, reproduction_output);
         HASH_FIELD(hash, organism, acceptance_output);
@@ -582,6 +683,8 @@ uint64_t alife_world_hash(const AlifeWorld *world) {
         HASH_FIELD(hash, organism, wake_output);
         HASH_FIELD(hash, organism, off_output);
         HASH_FIELD(hash, organism, off_duration_output);
+        HASH_FIELD(hash, organism, courtship_output);
+        HASH_FIELD(hash, organism, courtship_input);
         hash = hash_bytes(hash, alife_slot_const(world, i),
                           world->layout.slot_floats * sizeof(float));
     }

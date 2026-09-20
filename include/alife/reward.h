@@ -8,6 +8,7 @@
 typedef struct {
     uint64_t tick;
     uint64_t age;
+    uint64_t biological_age_increment;
     uint64_t accumulated_reward;
     bool survived_tick;
 } AlifeRewardContext;
