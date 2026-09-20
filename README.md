@@ -46,6 +46,19 @@ plasticity continue without fresh external inputs or externally visible
 outputs. Off is complete suspension: the network does not execute until its
 validated timer returns it to sleep.
 
+Seed genomes contain a weak two-neuron recurrent rhythm that drives the normal
+sleep and wake outputs. It is only an initialization pattern in ordinary
+weights, biases, and output connections. Those genes undergo the same
+recombination and mutation as the rest of the network, so evolution can change,
+repurpose, or eliminate the rhythm. The substrate does not track sleep
+pressure, sleep debt, a circadian phase, or mandatory state durations.
+
+While awake, calendar inputs can influence the same recurrent network. While
+asleep, that network continues from stored hidden state without fresh calendar
+or environmental inputs, which allows an internal phase to request waking.
+Only off duration remains substrate-scheduled after a sleeping network requests
+off.
+
 Age and survived-age reward advance in every state. Sleeping and off organisms
 also continue to consume capacity and can be displaced as the oldest organism.
 Seeds and offspring begin awake.
@@ -108,7 +121,8 @@ build/alife inspect --checkpoint run.chk
 
 `inspect` reads the checkpoint header and prints one JSON object with the
 checkpoint version, configuration fingerprint, tick, simulated date,
-population, births, and deaths. It does not load or execute organisms.
+population, births, deaths, and total state transitions. It does not load or
+execute organisms.
 
 Configuration files use one `key=value` entry per line. Blank lines are
 ignored, and `#` starts a comment. Unspecified keys retain documented defaults.
@@ -148,7 +162,7 @@ calibration guidance.
 | `foolsday_sleep_death_probability` | Per-organism probability of death while asleep on April 1, evaluated once that day. |
 | `off_min_duration_ticks` | Minimum accepted relative off duration in ticks. |
 | `off_max_duration_ticks` | Maximum accepted relative off duration in ticks. |
-| `state_transition_threshold` | Exclusive threshold for neural sleep, wake, and off requests. |
+| `state_transition_threshold` | Exclusive gate for neural sleep, wake, and off requests; it does not define their timing. |
 | `summary_interval` | Positive tick interval for terminal and summary records. |
 | `checkpoint_interval` | Positive tick interval for scheduled checkpoints. |
 | `checkpoint_path` | Destination for scheduled binary checkpoints. |
@@ -168,6 +182,10 @@ do not require a lifecycle record.
 At normal completion, the CLI writes `final_tick`, final living `population`,
 and a hexadecimal `state_hash` to standard output. Use the state hash as a quick
 same-build reproducibility check.
+
+Summaries include cumulative total, awake-to-sleep, sleep-to-awake, and
+sleep-to-off transition counts. Select `events` logging when you need each
+individual transition record.
 
 ## How the model works
 

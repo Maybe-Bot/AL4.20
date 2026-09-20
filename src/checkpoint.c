@@ -12,6 +12,14 @@ static const unsigned char checkpoint_magic[8] = {
 
 static bool checkpoint_date_valid(int32_t year, int32_t month, int32_t day);
 
+static bool transition_counts_valid(uint64_t total, uint64_t awake_to_asleep,
+                                    uint64_t asleep_to_awake,
+                                    uint64_t asleep_to_off) {
+    return awake_to_asleep <= total &&
+           asleep_to_awake <= total - awake_to_asleep &&
+           asleep_to_off <= total - awake_to_asleep - asleep_to_awake;
+}
+
 static bool write_bytes(FILE *file, const void *value, size_t size) {
     return fwrite(value, 1U, size, file) == size;
 }
@@ -53,6 +61,10 @@ static bool write_header(FILE *file, const AlifeWorld *world) {
         !write_u64(file, world->total_reproduction_attempts) ||
         !write_u64(file, world->total_mutations) ||
         !write_u64(file, world->total_executions) ||
+        !write_u64(file, world->total_state_transitions) ||
+        !write_u64(file, world->awake_to_asleep_transitions) ||
+        !write_u64(file, world->asleep_to_awake_transitions) ||
+        !write_u64(file, world->asleep_to_off_transitions) ||
         !write_i32(file, world->year) ||
         !write_i32(file, world->month) ||
         !write_i32(file, world->day) ||
@@ -113,6 +125,10 @@ bool alife_world_save(AlifeWorld *world, const char *path,
         world->next_id == 0U || world->next_id != world->total_births + 1U ||
         world->population_bytes !=
             (uint64_t)world->count * (uint64_t)alife_organism_size(world) ||
+        !transition_counts_valid(world->total_state_transitions,
+                                 world->awake_to_asleep_transitions,
+                                 world->asleep_to_awake_transitions,
+                                 world->asleep_to_off_transitions) ||
         (world->rng.state[0] | world->rng.state[1] |
          world->rng.state[2] | world->rng.state[3]) == 0U) {
         alife_set_error(error, error_size,
@@ -179,6 +195,10 @@ typedef struct {
     uint64_t attempts;
     uint64_t mutations;
     uint64_t executions;
+    uint64_t state_transitions;
+    uint64_t awake_to_asleep;
+    uint64_t asleep_to_awake;
+    uint64_t asleep_to_off;
     int32_t year;
     int32_t month;
     int32_t day;
@@ -212,6 +232,10 @@ static bool read_header(FILE *file, CheckpointHeader *header,
         !read_u64(file, &header->attempts) ||
         !read_u64(file, &header->mutations) ||
         !read_u64(file, &header->executions) ||
+        !read_u64(file, &header->state_transitions) ||
+        !read_u64(file, &header->awake_to_asleep) ||
+        !read_u64(file, &header->asleep_to_awake) ||
+        !read_u64(file, &header->asleep_to_off) ||
         !read_i32(file, &header->year) ||
         !read_i32(file, &header->month) ||
         !read_i32(file, &header->day) ||
@@ -343,6 +367,10 @@ bool alife_world_load(AlifeWorld *world, const AlifeConfig *config,
         header.next_id == 0U || header.next_id != header.births + 1U ||
         header.tick > config->tick_count || header.deaths > header.births ||
         header.count != header.births - header.deaths ||
+        !transition_counts_valid(header.state_transitions,
+                                 header.awake_to_asleep,
+                                 header.asleep_to_awake,
+                                 header.asleep_to_off) ||
         (header.rng[0] | header.rng[1] | header.rng[2] | header.rng[3]) == 0U) {
         alife_set_error(error, error_size,
                         "The checkpoint contains invalid substrate state.");
@@ -437,6 +465,10 @@ bool alife_world_load(AlifeWorld *world, const AlifeConfig *config,
     world->total_reproduction_attempts = header.attempts;
     world->total_mutations = header.mutations;
     world->total_executions = header.executions;
+    world->total_state_transitions = header.state_transitions;
+    world->awake_to_asleep_transitions = header.awake_to_asleep;
+    world->asleep_to_awake_transitions = header.asleep_to_awake;
+    world->asleep_to_off_transitions = header.asleep_to_off;
     world->year = header.year;
     world->month = header.month;
     world->day = header.day;
@@ -475,10 +507,11 @@ bool alife_checkpoint_inspect(const char *path, FILE *output,
                   ",\"config_fingerprint\":%" PRIu64
                   ",\"tick\":%" PRIu64 ",\"population\":%" PRIu64
                   ",\"date\":\"%04" PRId32 "-%02" PRId32 "-%02" PRId32
-                  "\",\"births\":%" PRIu64 ",\"deaths\":%" PRIu64 "}\n",
+                  "\",\"births\":%" PRIu64 ",\"deaths\":%" PRIu64
+                  ",\"state_transitions\":%" PRIu64 "}\n",
                   header.version, header.fingerprint, header.tick, header.count,
                   header.year, header.month, header.day,
-                  header.births, header.deaths);
+                  header.births, header.deaths, header.state_transitions);
     return true;
 }
 
@@ -514,6 +547,10 @@ uint64_t alife_world_hash(const AlifeWorld *world) {
     HASH_FIELD(hash, world, total_reproduction_attempts);
     HASH_FIELD(hash, world, total_mutations);
     HASH_FIELD(hash, world, total_executions);
+    HASH_FIELD(hash, world, total_state_transitions);
+    HASH_FIELD(hash, world, awake_to_asleep_transitions);
+    HASH_FIELD(hash, world, asleep_to_awake_transitions);
+    HASH_FIELD(hash, world, asleep_to_off_transitions);
     HASH_FIELD(hash, world, year);
     HASH_FIELD(hash, world, month);
     HASH_FIELD(hash, world, day);

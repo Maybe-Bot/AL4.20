@@ -9,7 +9,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define ALIFE_CHECKPOINT_VERSION 2U
+#define ALIFE_CHECKPOINT_VERSION 3U
 #define ALIFE_MIN_GENOME_PARAMETERS 500U
 #define ALIFE_MAX_GENOME_PARAMETERS 2000U
 #define ALIFE_PRIVATE_CONTROL_OUTPUTS 4U
@@ -103,6 +103,10 @@ typedef struct {
     uint64_t total_reproduction_attempts;
     uint64_t total_mutations;
     uint64_t total_executions;
+    uint64_t total_state_transitions;
+    uint64_t awake_to_asleep_transitions;
+    uint64_t asleep_to_awake_transitions;
+    uint64_t asleep_to_off_transitions;
     uint64_t population_bytes;
     int32_t year;
     int32_t month;

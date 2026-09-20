@@ -352,6 +352,178 @@ cleanup:
     return test_result_value;
 }
 
+static enum test_result test_seeded_neural_sleep_rhythm(void)
+{
+    enum test_result test_result_value = TEST_PASS;
+    AlifeConfig config;
+    AlifeWorld world = {0};
+    char error[TEST_ERROR_SIZE] = {0};
+    uint64_t ids[2];
+    uint64_t first_sleep[2] = {UINT64_MAX, UINT64_MAX};
+    uint64_t first_wake[2] = {UINT64_MAX, UINT64_MAX};
+    uint64_t awake_samples = 0U;
+    uint64_t asleep_samples = 0U;
+    size_t step;
+    size_t organism_index;
+
+    prepare_config(&config);
+    config.tick_count = UINT64_C(300);
+    config.maturity_age = UINT64_C(1000000);
+    EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)), error);
+    ids[0] = world.organisms[0].id;
+    ids[1] = world.organisms[1].id;
+
+    for (step = 0U; step < 240U; ++step) {
+        EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+        for (organism_index = 0U; organism_index < 2U; ++organism_index) {
+            const AlifeOrganism *organism =
+                alife_find_organism(&world, ids[organism_index]);
+
+            EXPECT_TRUE(organism != NULL);
+            if (organism->state == ALIFE_STATE_ASLEEP &&
+                first_sleep[organism_index] == UINT64_MAX) {
+                first_sleep[organism_index] = world.tick;
+            }
+            if (first_sleep[organism_index] != UINT64_MAX &&
+                organism->state == ALIFE_STATE_AWAKE &&
+                first_wake[organism_index] == UINT64_MAX) {
+                first_wake[organism_index] = world.tick;
+            }
+        }
+        if (alife_find_organism(&world, ids[0])->state == ALIFE_STATE_AWAKE) {
+            ++awake_samples;
+        } else if (alife_find_organism(&world, ids[0])->state ==
+                   ALIFE_STATE_ASLEEP) {
+            ++asleep_samples;
+        }
+    }
+    EXPECT_TRUE(first_sleep[0] != UINT64_MAX);
+    EXPECT_TRUE(first_sleep[1] != UINT64_MAX);
+    EXPECT_TRUE(first_wake[0] != UINT64_MAX);
+    EXPECT_TRUE(first_wake[1] != UINT64_MAX);
+    EXPECT_TRUE(awake_samples >= UINT64_C(60));
+    EXPECT_TRUE(asleep_samples >= UINT64_C(60));
+    EXPECT_TRUE(first_sleep[0] != first_sleep[1] ||
+                first_wake[0] != first_wake[1]);
+    EXPECT_TRUE(world.awake_to_asleep_transitions > 0U);
+    EXPECT_TRUE(world.asleep_to_awake_transitions > 0U);
+    EXPECT_TRUE(world.asleep_to_off_transitions == 0U);
+
+cleanup:
+    alife_world_destroy(&world);
+    return test_result_value;
+}
+
+static enum test_result test_seeded_rhythm_is_heritable_genome_data(void)
+{
+    enum test_result test_result_value = TEST_PASS;
+    AlifeConfig config;
+    AlifeWorld world = {0};
+    char error[TEST_ERROR_SIZE] = {0};
+    const float *first;
+    const float *second;
+    size_t hidden;
+    size_t communication;
+    size_t sleep_weight;
+    size_t wake_weight;
+    size_t parameter;
+    bool genomes_differ = false;
+
+    prepare_config(&config);
+    EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)), error);
+    first = alife_organism_genome(&world, world.organisms[0].id);
+    second = alife_organism_genome(&world, world.organisms[1].id);
+    hidden = (size_t)config.hidden_size;
+    communication = (size_t)config.communication_size;
+    sleep_weight = world.layout.output_weights +
+        (communication + ALIFE_OUTPUT_SLEEP) * hidden;
+    wake_weight = world.layout.output_weights +
+        (communication + ALIFE_OUTPUT_WAKE) * hidden;
+    EXPECT_TRUE(first != NULL);
+    EXPECT_TRUE(second != NULL);
+    EXPECT_TRUE(world.layout.recurrent_weights + hidden + 1U <
+                world.layout.genome_count);
+    EXPECT_TRUE(sleep_weight < world.layout.genome_count);
+    EXPECT_TRUE(wake_weight < world.layout.genome_count);
+    EXPECT_TRUE(first[world.layout.recurrent_weights] > 0.0F);
+    EXPECT_TRUE(first[world.layout.recurrent_weights + 1U] < 0.0F);
+    EXPECT_TRUE(first[world.layout.recurrent_weights + hidden] > 0.0F);
+    EXPECT_TRUE(first[sleep_weight] > 0.0F);
+    EXPECT_TRUE(first[wake_weight] < 0.0F);
+    for (parameter = 0U; parameter < world.layout.genome_count; ++parameter) {
+        if (first[parameter] != second[parameter]) {
+            genomes_differ = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(genomes_differ);
+
+cleanup:
+    alife_world_destroy(&world);
+    return test_result_value;
+}
+
+static enum test_result test_no_substrate_sleep_timer(void)
+{
+    enum test_result test_result_value = TEST_PASS;
+    AlifeConfig config;
+    AlifeWorld world = {0};
+    char error[TEST_ERROR_SIZE] = {0};
+    uint64_t id;
+    size_t step;
+
+    prepare_config(&config);
+    config.tick_count = UINT64_C(200);
+    config.maturity_age = UINT64_C(1000000);
+    EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)), error);
+    id = world.organisms[0].id;
+    set_controls(&world, id, -4.0F, -4.0F, -4.0F, -1.0F);
+    for (step = 0U; step < 160U; ++step) {
+        EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+        EXPECT_TRUE(alife_find_organism(&world, id)->state == ALIFE_STATE_AWAKE);
+        EXPECT_TRUE(alife_find_organism(&world, id)->back_on_tick == 0U);
+    }
+    EXPECT_TRUE(alife_find_organism(&world, id)->executions == UINT64_C(160));
+
+cleanup:
+    alife_world_destroy(&world);
+    return test_result_value;
+}
+
+static enum test_result test_sleep_rhythm_is_reachable_across_seeds(void)
+{
+    enum test_result test_result_value = TEST_PASS;
+    static const uint64_t seeds[] = {
+        UINT64_C(1), UINT64_C(2), UINT64_C(3), UINT64_C(4), UINT64_C(5)
+    };
+    AlifeWorld world = {0};
+    char error[TEST_ERROR_SIZE] = {0};
+    size_t seed_index;
+
+    for (seed_index = 0U;
+         seed_index < sizeof(seeds) / sizeof(seeds[0]); ++seed_index) {
+        AlifeConfig config;
+        size_t step;
+
+        prepare_config(&config);
+        config.seed = seeds[seed_index];
+        config.tick_count = UINT64_C(160);
+        config.maturity_age = UINT64_C(1000000);
+        EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)),
+                    error);
+        for (step = 0U; step < 140U; ++step) {
+            EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+        }
+        EXPECT_TRUE(world.awake_to_asleep_transitions > 0U);
+        EXPECT_TRUE(world.asleep_to_awake_transitions > 0U);
+        alife_world_destroy(&world);
+    }
+
+cleanup:
+    alife_world_destroy(&world);
+    return test_result_value;
+}
+
 static enum test_result test_transition_graph_and_control_outputs(void)
 {
     enum test_result test_result_value = TEST_PASS;
@@ -771,7 +943,7 @@ static enum test_result test_identical_seeds_are_reproducible(void)
     EXPECT_CALL(alife_world_init(&second, &config, error, sizeof(error)), error);
     EXPECT_TRUE(alife_world_hash(&first) == alife_world_hash(&second));
 
-    for (step = 0U; step < 32U; ++step) {
+    for (step = 0U; step < 90U; ++step) {
         EXPECT_CALL(alife_world_step(&first, error, sizeof(error)), error);
         EXPECT_CALL(alife_world_step(&second, error, sizeof(error)), error);
         EXPECT_TRUE(alife_world_hash(&first) == alife_world_hash(&second));
@@ -796,6 +968,7 @@ static enum test_result test_mutation_stays_within_bounds(void)
     float *second_genome;
     const float *child_genome;
     size_t parameter;
+    size_t oscillator_parameter;
 
     prepare_config(&config);
     config.mutation_probability = 1.0;
@@ -822,6 +995,9 @@ static enum test_result test_mutation_stays_within_bounds(void)
     first_genome = alife_organism_genome_mut(&world, parent_a);
     EXPECT_TRUE(child_genome != NULL);
     EXPECT_TRUE(first_genome != NULL);
+    oscillator_parameter = world.layout.recurrent_weights;
+    EXPECT_TRUE(child_genome[oscillator_parameter] !=
+                first_genome[oscillator_parameter]);
     for (parameter = 0U; parameter < world.layout.genome_count; ++parameter) {
         const double change = fabs((double)child_genome[parameter] -
                                    (double)first_genome[parameter]);
@@ -868,18 +1044,6 @@ static enum test_result test_checkpoint_resume_preserves_state(void)
     EXPECT_CALL(alife_transition_request(&split, split.organisms[0].id,
                                          ALIFE_STATE_OFF, 50U, error,
                                          sizeof(error)), error);
-    EXPECT_CALL(alife_transition_request(&uninterrupted,
-                                         uninterrupted.organisms[1].id,
-                                         ALIFE_STATE_ASLEEP, 0U, error,
-                                         sizeof(error)), error);
-    EXPECT_CALL(alife_transition_request(&split, split.organisms[1].id,
-                                         ALIFE_STATE_ASLEEP, 0U, error,
-                                         sizeof(error)), error);
-    set_controls(&uninterrupted, uninterrupted.organisms[1].id,
-                 -4.0F, -4.0F, -4.0F, -1.0F);
-    set_controls(&split, split.organisms[1].id,
-                 -4.0F, -4.0F, -4.0F, -1.0F);
-
     for (step = 0U; step < 7U; ++step) {
         EXPECT_CALL(alife_world_step(&uninterrupted, error, sizeof(error)),
                     error);
@@ -897,14 +1061,15 @@ static enum test_result test_checkpoint_resume_preserves_state(void)
     EXPECT_TRUE(alife_world_hash(&resumed) == checkpoint_hash);
     EXPECT_TRUE(resumed.organisms[0].state == ALIFE_STATE_OFF);
     EXPECT_TRUE(resumed.organisms[0].back_on_tick == UINT64_C(50));
-    EXPECT_TRUE(resumed.organisms[1].state == ALIFE_STATE_ASLEEP);
+    EXPECT_TRUE(resumed.organisms[1].state != ALIFE_STATE_OFF);
 
-    for (step = 0U; step < 12U; ++step) {
+    for (step = 0U; step < 80U; ++step) {
         EXPECT_CALL(alife_world_step(&uninterrupted, error, sizeof(error)),
                     error);
         EXPECT_CALL(alife_world_step(&resumed, error, sizeof(error)), error);
     }
     EXPECT_TRUE(alife_world_hash(&uninterrupted) == alife_world_hash(&resumed));
+    EXPECT_TRUE(resumed.asleep_to_awake_transitions > 0U);
 
 cleanup:
     alife_world_destroy(&uninterrupted);
@@ -994,6 +1159,8 @@ static enum test_result test_lifecycle_observability_records(void)
                 NULL);
     EXPECT_TRUE(strstr(contents,
                        "\"awake\":0,\"asleep\":1,\"off\":1") != NULL);
+    EXPECT_TRUE(strstr(contents, "\"state_transitions\":3") != NULL);
+    EXPECT_TRUE(strstr(contents, "\"awake_to_asleep\":2") != NULL);
 
 cleanup:
     if (log_file != NULL) {
@@ -1021,6 +1188,13 @@ int main(void)
          test_capacity_removes_oldest_organism},
         {"seeds and offspring begin awake",
          test_initial_and_offspring_states_are_awake},
+        {"seeded neural rhythm reaches sleep and wake",
+         test_seeded_neural_sleep_rhythm},
+        {"seeded rhythm is ordinary heritable genome data",
+         test_seeded_rhythm_is_heritable_genome_data},
+        {"sleep has no substrate timer", test_no_substrate_sleep_timer},
+        {"sleep rhythm is reachable across seeds",
+         test_sleep_rhythm_is_reachable_across_seeds},
         {"transition graph and control outputs are enforced",
          test_transition_graph_and_control_outputs},
         {"sleep and off disable external behavior",

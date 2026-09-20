@@ -10,10 +10,10 @@ stable data format.
 The configured logging level controls volume:
 
 - `error` writes only diagnostics to standard error.
-- `summary` writes lifecycle, Fool's Day roll, checkpoint, periodic summary,
-  and run-boundary records. Lifecycle records preserve every birth, state
-  transition, and death cause.
-- `events` adds reproduction-attempt and sampled plasticity records.
+- `summary` writes births, deaths, Fool's Day rolls, checkpoints, periodic
+  summaries, and run-boundary records.
+- `events` adds state transitions, reproduction attempts, and sampled
+  plasticity records.
 
 ## Common fields
 
@@ -62,6 +62,8 @@ Records a substrate-approved lifecycle transition. Fields include
 `back_on_tick`, in addition to the common tick and date. A duration and back-on
 tick are nonzero only when entering off. The states are `awake`, `asleep`, and
 `off`.
+These records require `logging_level = events`. Summary records retain
+cumulative transition totals without the per-organism event volume.
 
 ### `foolsday_sleep_roll`
 
@@ -113,7 +115,10 @@ mutation counters, significant weight changes, and `cause`.
 
 Records periodic population statistics. Fields include `population`, `awake`,
 `asleep`, `off`, `population_bytes`, `population_genome_parameters`, and
-cumulative births, deaths, reproduction attempts, and mutations.
+cumulative births, deaths, reproduction attempts, mutations,
+`state_transitions`, `awake_to_asleep`, `asleep_to_awake`, and
+`asleep_to_off`. Total transitions also include timer-driven off-to-sleep
+transitions.
 
 ### `checkpoint`
 
@@ -155,9 +160,9 @@ The exact optional fields depend on the configured logging level. A minimal
 event stream resembles:
 
 ```json
-{"event":"run_start","log_version":2,"tick":0,"year":2000,"month":1,"day":1,"seed":420,"config_fingerprint":6759519941994754753,"resumed":false}
+{"event":"run_start","log_version":3,"tick":0,"year":2000,"month":1,"day":1,"seed":420,"config_fingerprint":6759519941994754753,"resumed":false}
 {"event":"birth","tick":0,"year":2000,"month":1,"day":1,"organism_id":1,"parent_a":0,"parent_b":0,"generation":0,"organism_bytes":8192,"mutations":0,"state":"awake"}
-{"event":"summary","tick":1000,"year":2000,"month":1,"day":2,"population":17,"awake":10,"asleep":5,"off":2,"population_bytes":139264,"births":17,"deaths":0,"reproduction_attempts":31,"mutations":6}
+{"event":"summary","tick":1000,"year":2000,"month":1,"day":2,"population":17,"awake":10,"asleep":5,"off":2,"population_bytes":139264,"state_transitions":411,"awake_to_asleep":207,"asleep_to_awake":190,"asleep_to_off":7,"births":17,"deaths":0,"reproduction_attempts":31,"mutations":6}
 {"event":"death","tick":1001,"year":2000,"month":1,"day":2,"organism_id":2,"cause":"capacity","birth_tick":0,"age":1001,"reward":1001,"generation":0,"reproduction_attempts":4,"successful_reproduction":1,"mutations":0,"significant_weight_changes":3}
 ```
 

@@ -77,7 +77,7 @@ void alife_log_run_start(AlifeWorld *world) {
     }
     event_prefix(world, "run_start");
     (void)fprintf(world->event_log,
-                  ",\"log_version\":2,\"seed\":%" PRIu64
+                  ",\"log_version\":3,\"seed\":%" PRIu64
                   ",\"config_fingerprint\":%" PRIu64 ",\"resumed\":%s"
                   "}\n",
                   world->config.seed,
@@ -92,8 +92,10 @@ void alife_log_run_end(AlifeWorld *world) {
     event_prefix(world, "run_end");
     (void)fprintf(world->event_log,
                   ",\"population\":%zu,\"births\":%" PRIu64
-                  ",\"deaths\":%" PRIu64 "}\n",
-                  world->count, world->total_births, world->total_deaths);
+                  ",\"deaths\":%" PRIu64
+                  ",\"state_transitions\":%" PRIu64 "}\n",
+                  world->count, world->total_births, world->total_deaths,
+                  world->total_state_transitions);
     (void)fflush(world->event_log);
 }
 
@@ -183,11 +185,18 @@ void alife_log_summary(AlifeWorld *world) {
                       "tick=%" PRIu64 " date=%04" PRId32 "-%02" PRId32
                       "-%02" PRId32 " population=%zu mass=%" PRIu64
                       " parameters=%zu awake=%zu asleep=%zu off=%zu"
+                      " transitions=%" PRIu64 " awake_to_asleep=%" PRIu64
+                      " asleep_to_awake=%" PRIu64
+                      " asleep_to_off=%" PRIu64
                       " births=%" PRIu64 " deaths=%" PRIu64 "\n",
                       world->tick, world->year, world->month, world->day,
                       world->count, world->population_bytes,
                       world->count * world->layout.genome_count,
                       awake, asleep, off,
+                      world->total_state_transitions,
+                      world->awake_to_asleep_transitions,
+                      world->asleep_to_awake_transitions,
+                      world->asleep_to_off_transitions,
                       world->total_births, world->total_deaths);
     }
     if (!summaries_enabled(world)) {
@@ -198,12 +207,20 @@ void alife_log_summary(AlifeWorld *world) {
                   ",\"population\":%zu,\"population_bytes\":%" PRIu64
                   ",\"population_genome_parameters\":%zu"
                   ",\"awake\":%zu,\"asleep\":%zu,\"off\":%zu"
+                  ",\"state_transitions\":%" PRIu64
+                  ",\"awake_to_asleep\":%" PRIu64
+                  ",\"asleep_to_awake\":%" PRIu64
+                  ",\"asleep_to_off\":%" PRIu64
                   ",\"births\":%" PRIu64 ",\"deaths\":%" PRIu64
                   ",\"reproduction_attempts\":%" PRIu64
                   ",\"mutations\":%" PRIu64 "}\n",
                   world->count, world->population_bytes,
                   world->count * world->layout.genome_count,
                   awake, asleep, off,
+                  world->total_state_transitions,
+                  world->awake_to_asleep_transitions,
+                  world->asleep_to_awake_transitions,
+                  world->asleep_to_off_transitions,
                   world->total_births,
                   world->total_deaths, world->total_reproduction_attempts,
                   world->total_mutations);
@@ -238,7 +255,7 @@ void alife_log_state_transition(AlifeWorld *world,
                                 const AlifeOrganism *organism,
                                 AlifeLifecycleState previous_state,
                                 uint64_t requested_off_duration) {
-    if (!summaries_enabled(world)) {
+    if (!events_enabled(world)) {
         return;
     }
     event_prefix(world, "state_transition");

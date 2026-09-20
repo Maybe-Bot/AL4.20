@@ -99,6 +99,23 @@ organisms use the same representation and mating rules; neither has a symbolic
 name or a fixed sex. Seed births have parent IDs of zero. Seeds and offspring
 always begin awake.
 
+### Seeded neural rhythm
+
+After random genome initialization, the substrate shapes two ordinary hidden
+neurons into a weak rotating recurrent motif. Their ordinary output weights
+drive opposing sleep and wake signals. A small bias initializes nonzero hidden
+state, weak input weights leave a path for awake calendar signals, and a
+negative off bias keeps early off requests rarer than sleep requests.
+
+This shaping happens only when the seed genome is created. The motif has no
+runtime scheduler, phase counter, fixed duration, or protected parameters. Its
+input, recurrent, bias, plasticity, and output genes remain in the normal
+genome ranges and pass through normal sexual recombination and mutation.
+Newborn hidden state is initialized from heritable hidden biases. The related
+second seed receives a bounded mutation in the rhythm when ordinary seed
+mutation does not already change it, which avoids requiring identical initial
+timing without assigning a fixed sleep personality.
+
 ## Lifecycle states
 
 Each organism occupies exactly one substrate-managed state:
@@ -126,6 +143,10 @@ The legal edges are awake to asleep, asleep to awake, asleep to off, and off to
 asleep after timer expiry. Awake to off and off to awake are invalid. Timer
 expiry returns an organism to asleep before it runs, so it completes at least
 one sleep computation before any possible wake request takes effect.
+
+The transition threshold is only a substrate gate. Sleep and wake timing comes
+from neural output trajectories crossing that gate; the substrate does not
+accumulate sleep pressure or enforce a biological clock.
 
 ## Lifetime plasticity
 
@@ -309,7 +330,9 @@ compatibility metadata, and configured dimensions. The body includes the clock
 and calendar state, PRNG state, ID allocator, statistics, living organism
 records, lifecycle states, back-on ticks, Fool's Day roll years, genomes,
 neural state, lifetime weights, and pending communication required for exact
-continuation. Checkpoint format version 2 introduced the lifecycle fields.
+continuation. Checkpoint format version 3 also preserves aggregate transition
+counters. Hidden activations and lifetime deltas preserve the neural phase
+needed for an exact resumed sleep rhythm.
 
 The reader checks all counts and sizes before using them and rejects incompatible
 versions or dimensions. Even with those checks, treat checkpoint files as

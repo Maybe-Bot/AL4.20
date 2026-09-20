@@ -21,6 +21,9 @@ or configuration is not a comparable baseline. Instrumentation can also change
 floating-point code generation. Compare deterministic state hashes only
 between identical builds.
 
+The initial rhythm reuses two neurons in the existing recurrent network. It
+adds no per-tick allocation, second network, search, thread, or GPU dependency.
+
 ## Calibrate a long run
 
 Run the small configuration first and record wall time, final population, and

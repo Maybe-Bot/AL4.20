@@ -16,6 +16,8 @@
 #define ALIFE_MAX_COMMUNICATION 8U
 #define ALIFE_PLASTIC_RATE_SCALE 0.05
 #define ALIFE_SIGNIFICANT_PLASTICITY 0.01
+#define ALIFE_SLEEP_OSCILLATOR_X 0U
+#define ALIFE_SLEEP_OSCILLATOR_Y 1U
 
 void alife_set_error(char *error, size_t error_size, const char *format, ...) {
     va_list arguments;
@@ -211,6 +213,61 @@ static bool open_event_log(AlifeWorld *world, const char *mode,
     return true;
 }
 
+static float bounded_gene(const AlifeWorld *world, double value) {
+    return (float)clamp_double(value, -world->config.max_abs_weight,
+                              world->config.max_abs_weight);
+}
+
+static void seed_sleep_rhythm(const AlifeWorld *world, float *genome) {
+    const size_t hidden = (size_t)world->config.hidden_size;
+    const size_t input_count = (size_t)world->config.input_size +
+                               (size_t)world->config.communication_size;
+    const size_t communication = (size_t)world->config.communication_size;
+    const size_t x = ALIFE_SLEEP_OSCILLATOR_X;
+    const size_t y = ALIFE_SLEEP_OSCILLATOR_Y;
+    const double angle = 0.14;
+    const double gain = 1.12;
+    const size_t sleep_output = communication + ALIFE_OUTPUT_SLEEP;
+    const size_t wake_output = communication + ALIFE_OUTPUT_WAKE;
+    const size_t off_output = communication + ALIFE_OUTPUT_OFF;
+    size_t i;
+
+    for (i = 0U; i < input_count; ++i) {
+        genome[world->layout.input_weights + x * input_count + i] *= 0.05F;
+        genome[world->layout.input_weights + y * input_count + i] *= 0.05F;
+    }
+    for (i = 0U; i < hidden; ++i) {
+        genome[world->layout.recurrent_weights + x * hidden + i] = 0.0F;
+        genome[world->layout.recurrent_weights + y * hidden + i] = 0.0F;
+        genome[world->layout.output_weights + sleep_output * hidden + i] = 0.0F;
+        genome[world->layout.output_weights + wake_output * hidden + i] = 0.0F;
+        genome[world->layout.output_weights + off_output * hidden + i] *= 0.25F;
+    }
+    genome[world->layout.recurrent_weights + x * hidden + x] =
+        bounded_gene(world, gain * cos(angle));
+    genome[world->layout.recurrent_weights + x * hidden + y] =
+        bounded_gene(world, -gain * sin(angle));
+    genome[world->layout.recurrent_weights + y * hidden + x] =
+        bounded_gene(world, gain * sin(angle));
+    genome[world->layout.recurrent_weights + y * hidden + y] =
+        bounded_gene(world, gain * cos(angle));
+
+    genome[world->layout.hidden_biases + x] = bounded_gene(
+        world, 0.035 + 0.02 * (double)genome[world->layout.hidden_biases + x]);
+    genome[world->layout.hidden_biases + y] = bounded_gene(
+        world, 0.005 + 0.02 * (double)genome[world->layout.hidden_biases + y]);
+    genome[world->layout.plastic_rates + x] = 0.0F;
+    genome[world->layout.plastic_rates + y] = 0.0F;
+
+    genome[world->layout.output_weights + sleep_output * hidden + x] =
+        bounded_gene(world, 3.0);
+    genome[world->layout.output_weights + wake_output * hidden + x] =
+        bounded_gene(world, -3.0);
+    genome[world->layout.output_biases + sleep_output] = 0.0F;
+    genome[world->layout.output_biases + wake_output] = 0.0F;
+    genome[world->layout.output_biases + off_output] = bounded_gene(world, -0.75);
+}
+
 static void initialize_genome(AlifeWorld *world, float *genome) {
     size_t i;
     size_t hidden = (size_t)world->config.hidden_size;
@@ -244,6 +301,58 @@ static void initialize_genome(AlifeWorld *world, float *genome) {
          i < communication + ALIFE_NONCOMMUNICATION_OUTPUTS; ++i) {
         genome[world->layout.output_biases + i] = 0.0F;
     }
+    seed_sleep_rhythm(world, genome);
+}
+
+static bool is_sleep_rhythm_gene(const AlifeWorld *world, size_t position) {
+    const size_t hidden = (size_t)world->config.hidden_size;
+    const size_t communication = (size_t)world->config.communication_size;
+    const size_t sleep_weight = world->layout.output_weights +
+        (communication + ALIFE_OUTPUT_SLEEP) * hidden + ALIFE_SLEEP_OSCILLATOR_X;
+    const size_t wake_weight = world->layout.output_weights +
+        (communication + ALIFE_OUTPUT_WAKE) * hidden + ALIFE_SLEEP_OSCILLATOR_X;
+
+    return position == world->layout.recurrent_weights ||
+           position == world->layout.recurrent_weights + 1U ||
+           position == world->layout.recurrent_weights + hidden ||
+           position == world->layout.recurrent_weights + hidden + 1U ||
+           position == world->layout.hidden_biases + ALIFE_SLEEP_OSCILLATOR_X ||
+           position == world->layout.hidden_biases + ALIFE_SLEEP_OSCILLATOR_Y ||
+           position == sleep_weight || position == wake_weight;
+}
+
+static bool mutate_related_rhythm_gene(AlifeWorld *world, float *genome,
+                                       uint64_t *mutations) {
+    const size_t x_bias = world->layout.hidden_biases +
+                          ALIFE_SLEEP_OSCILLATOR_X;
+    const size_t y_bias = world->layout.hidden_biases +
+                          ALIFE_SLEEP_OSCILLATOR_Y;
+    const size_t position = alife_rng_bounded(&world->rng, 2U) == 0U ?
+                            x_bias : y_bias;
+    const double magnitude = world->config.mutation_magnitude;
+    const double direction = alife_rng_bounded(&world->rng, 2U) == 0U ?
+                             -1.0 : 1.0;
+    const double size = magnitude * (0.1 + 0.1 * alife_rng_unit(&world->rng));
+    const float old_value = genome[position];
+    double value;
+
+    if (magnitude == 0.0) {
+        return false;
+    }
+    value = clamp_double((double)old_value + direction * size,
+                         -world->config.max_abs_weight,
+                         world->config.max_abs_weight);
+    if ((float)value == old_value) {
+        value = clamp_double((double)old_value - direction * size,
+                             -world->config.max_abs_weight,
+                             world->config.max_abs_weight);
+    }
+    genome[position] = (float)value;
+    if (genome[position] != old_value) {
+        ++(*mutations);
+        return true;
+    }
+    return false;
 }
 
 static bool append_organism(AlifeWorld *world, const float *genome,
@@ -252,7 +361,7 @@ static bool append_organism(AlifeWorld *world, const float *genome,
                             char *error, size_t error_size) {
     AlifeOrganism *organism;
     float *slot;
-
+    size_t i;
     size_t organism_bytes = alife_organism_size(world);
 
     if (world->count == SIZE_MAX ||
@@ -280,6 +389,10 @@ static bool append_organism(AlifeWorld *world, const float *genome,
     slot = alife_slot(world, world->count);
     memset(slot, 0, world->layout.slot_floats * sizeof(*slot));
     memcpy(slot, genome, world->layout.genome_count * sizeof(*slot));
+    for (i = 0U; i < (size_t)world->config.hidden_size; ++i) {
+        slot[world->layout.hidden_state + i] =
+            (float)tanh((double)genome[world->layout.hidden_biases + i]);
+    }
     ++world->count;
     ++world->total_births;
     world->total_mutations += mutations;
@@ -295,6 +408,7 @@ static bool seed_population(AlifeWorld *world, char *error, size_t error_size) {
     size_t i;
     uint64_t mutations = 0U;
     double probability = world->config.mutation_probability;
+    bool rhythm_mutated = false;
 
     base = malloc(world->layout.genome_count * sizeof(*base));
     related = malloc(world->layout.genome_count * sizeof(*related));
@@ -319,8 +433,14 @@ static bool seed_population(AlifeWorld *world, char *error, size_t error_size) {
                                              world->config.max_abs_weight);
             if (related[i] != old_value) {
                 ++mutations;
+                if (is_sleep_rhythm_gene(world, i)) {
+                    rhythm_mutated = true;
+                }
             }
         }
+    }
+    if (!rhythm_mutated) {
+        (void)mutate_related_rhythm_gene(world, related, &mutations);
     }
     if (mutations == 0U) {
         size_t position = (size_t)alife_rng_bounded(
@@ -523,6 +643,7 @@ static bool transition_at(AlifeWorld *world, size_t index,
     AlifeOrganism *organism = &world->organisms[index];
     AlifeLifecycleState previous_state = organism->state;
     uint64_t duration = requested_off_duration;
+    bool count_transition;
     bool allowed = false;
 
     if (previous_state == ALIFE_STATE_AWAKE &&
@@ -563,6 +684,26 @@ static bool transition_at(AlifeWorld *world, size_t index,
                              world->tick + duration : 0U;
     if (requested_state != ALIFE_STATE_AWAKE) {
         clear_public_outputs(world, index);
+    }
+    count_transition = world->total_state_transitions < UINT64_MAX;
+    if (count_transition) {
+        ++world->total_state_transitions;
+    }
+    if (previous_state == ALIFE_STATE_AWAKE &&
+        requested_state == ALIFE_STATE_ASLEEP &&
+        count_transition &&
+        world->awake_to_asleep_transitions < UINT64_MAX) {
+        ++world->awake_to_asleep_transitions;
+    } else if (previous_state == ALIFE_STATE_ASLEEP &&
+               requested_state == ALIFE_STATE_AWAKE &&
+               count_transition &&
+               world->asleep_to_awake_transitions < UINT64_MAX) {
+        ++world->asleep_to_awake_transitions;
+    } else if (previous_state == ALIFE_STATE_ASLEEP &&
+               requested_state == ALIFE_STATE_OFF &&
+               count_transition &&
+               world->asleep_to_off_transitions < UINT64_MAX) {
+        ++world->asleep_to_off_transitions;
     }
     alife_log_state_transition(world, organism, previous_state,
                                requested_state == ALIFE_STATE_OFF ?
