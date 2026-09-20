@@ -73,6 +73,64 @@ static void make_reproduction_request(AlifeWorld *world, const uint64_t id)
     }
 }
 
+static void set_controls(AlifeWorld *world, const uint64_t id,
+                         const float sleep_value, const float wake_value,
+                         const float off_value, const float duration_value)
+{
+    float *genome = alife_organism_genome_mut(world, id);
+    const size_t communication = (size_t)world->config.communication_size;
+    const size_t hidden = (size_t)world->config.hidden_size;
+    const float values[ALIFE_PRIVATE_CONTROL_OUTPUTS] = {
+        sleep_value, wake_value, off_value, duration_value
+    };
+    size_t control;
+    size_t hidden_index;
+
+    if (genome == NULL) {
+        return;
+    }
+    for (control = 0U; control < ALIFE_PRIVATE_CONTROL_OUTPUTS; ++control) {
+        const size_t output = communication + ALIFE_OUTPUT_SLEEP + control;
+
+        genome[world->layout.output_biases + output] = values[control];
+        for (hidden_index = 0U; hidden_index < hidden; ++hidden_index) {
+            genome[world->layout.output_weights + output * hidden +
+                   hidden_index] = 0.0F;
+        }
+    }
+}
+
+static double plastic_state_sum(const AlifeWorld *world, const uint64_t id)
+{
+    const float *slot = alife_organism_genome(world, id);
+    size_t edge;
+    double total = 0.0;
+
+    if (slot == NULL) {
+        return 0.0;
+    }
+    for (edge = 0U; edge < world->layout.recurrent_count; ++edge) {
+        total += fabs((double)slot[world->layout.plastic_state + edge]);
+    }
+    return total;
+}
+
+static void prepare_plastic_activity(AlifeWorld *world, const uint64_t id)
+{
+    float *slot = alife_organism_genome_mut(world, id);
+    size_t hidden_index;
+
+    if (slot == NULL) {
+        return;
+    }
+    for (hidden_index = 0U;
+         hidden_index < (size_t)world->config.hidden_size; ++hidden_index) {
+        slot[world->layout.hidden_biases + hidden_index] = 1.0F;
+        slot[world->layout.plastic_rates + hidden_index] = 1.0F;
+        slot[world->layout.hidden_state + hidden_index] = 0.5F;
+    }
+}
+
 static enum test_result test_immature_organisms_cannot_reproduce(void)
 {
     enum test_result test_result_value = TEST_PASS;
@@ -108,6 +166,7 @@ static enum test_result test_example_configurations_are_valid(void)
     enum test_result test_result_value = TEST_PASS;
     AlifeConfig small;
     AlifeConfig long_run;
+    AlifeConfig invalid;
     char error[TEST_ERROR_SIZE] = {0};
 
     EXPECT_CALL(alife_config_load(&small, "configs/small.conf", error,
@@ -120,6 +179,15 @@ static enum test_result test_example_configurations_are_valid(void)
     EXPECT_TRUE(long_run.initial_population == 2U);
     EXPECT_TRUE(long_run.tick_count / long_run.ticks_per_day ==
                 UINT64_C(250));
+    invalid = small;
+    invalid.foolsday_sleep_death_probability = 1.01;
+    EXPECT_TRUE(!alife_config_validate(&invalid, error, sizeof(error)));
+    invalid = small;
+    invalid.off_min_duration_ticks = invalid.off_max_duration_ticks + 1U;
+    EXPECT_TRUE(!alife_config_validate(&invalid, error, sizeof(error)));
+    invalid = small;
+    invalid.state_transition_threshold = 1.0;
+    EXPECT_TRUE(!alife_config_validate(&invalid, error, sizeof(error)));
 
 cleanup:
     return test_result_value;
@@ -232,6 +300,13 @@ static enum test_result test_capacity_removes_oldest_organism(void)
     EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)), error);
     oldest_id = world.organisms[0].id;
     younger_id = world.organisms[1].id;
+    EXPECT_CALL(alife_transition_request(&world, oldest_id, ALIFE_STATE_ASLEEP,
+                                         0U, error, sizeof(error)), error);
+    EXPECT_CALL(alife_transition_request(&world, oldest_id, ALIFE_STATE_OFF,
+                                         config.off_min_duration_ticks, error,
+                                         sizeof(error)), error);
+    EXPECT_CALL(alife_transition_request(&world, younger_id, ALIFE_STATE_ASLEEP,
+                                         0U, error, sizeof(error)), error);
     world.organisms[0].age = UINT64_C(100);
     world.organisms[1].age = UINT64_C(10);
     world.config.capacity_bytes = (uint64_t)alife_organism_size(&world);
@@ -240,6 +315,8 @@ static enum test_result test_capacity_removes_oldest_organism(void)
     EXPECT_TRUE(world.count == 1U);
     EXPECT_TRUE(alife_find_organism(&world, oldest_id) == NULL);
     EXPECT_TRUE(alife_find_organism(&world, younger_id) != NULL);
+    EXPECT_TRUE(alife_find_organism(&world, younger_id)->state ==
+                ALIFE_STATE_ASLEEP);
     EXPECT_TRUE(world.population_bytes <= world.config.capacity_bytes);
     EXPECT_TRUE(world.total_deaths == UINT64_C(1));
 
@@ -248,101 +325,364 @@ cleanup:
     return test_result_value;
 }
 
-static enum test_result test_april_first_prevents_execution(void)
+static enum test_result test_initial_and_offspring_states_are_awake(void)
 {
     enum test_result test_result_value = TEST_PASS;
     AlifeConfig config;
     AlifeWorld world = {0};
     char error[TEST_ERROR_SIZE] = {0};
-    uint64_t executions_before;
-    size_t attempt;
+    uint64_t child_id;
 
     prepare_config(&config);
-    config.calendar_start_year = 2028U;
-    config.calendar_start_month = 3U;
-    config.calendar_start_day = 31U;
-    config.ticks_per_day = UINT64_C(1);
-    config.april_1_behavior = ALIFE_APRIL_TERMINATE;
     EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)), error);
-    executions_before = UINT64_C(0);
-    for (attempt = 0U;
-         attempt < 2U && !(world.month == 4 && world.day == 1);
-         ++attempt) {
-        executions_before = world.total_executions;
-        EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
-    }
-    EXPECT_TRUE(world.year == 2028);
-    EXPECT_TRUE(world.month == 4);
-    EXPECT_TRUE(world.day == 1);
-    EXPECT_TRUE(world.total_executions == executions_before);
-    EXPECT_TRUE(world.count == 0U);
-    EXPECT_TRUE(world.total_deaths == UINT64_C(2));
+    EXPECT_TRUE(world.organisms[0].state == ALIFE_STATE_AWAKE);
+    EXPECT_TRUE(world.organisms[1].state == ALIFE_STATE_AWAKE);
+    world.organisms[0].age = config.maturity_age;
+    world.organisms[1].age = config.maturity_age;
+    make_reproduction_request(&world, world.organisms[0].id);
+    make_reproduction_request(&world, world.organisms[1].id);
+    child_id = world.next_id;
+    EXPECT_CALL(alife_try_birth(&world, world.organisms[0].id,
+                                world.organisms[1].id, true, error,
+                                sizeof(error)), error);
+    EXPECT_TRUE(alife_find_organism(&world, child_id)->state == ALIFE_STATE_AWAKE);
 
 cleanup:
     alife_world_destroy(&world);
     return test_result_value;
 }
 
-static enum test_result test_april_first_cannot_be_bypassed(void)
+static enum test_result test_transition_graph_and_control_outputs(void)
 {
     enum test_result test_result_value = TEST_PASS;
     AlifeConfig config;
     AlifeWorld world = {0};
     char error[TEST_ERROR_SIZE] = {0};
-    float *genome;
+    uint64_t id;
 
     prepare_config(&config);
-    config.calendar_start_year = 2027U;
+    config.off_min_duration_ticks = UINT64_C(3);
+    config.off_max_duration_ticks = UINT64_C(7);
+    EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)), error);
+    id = world.organisms[0].id;
+    EXPECT_TRUE(!alife_transition_request(&world, id, ALIFE_STATE_OFF, 3U,
+                                          error, sizeof(error)));
+    set_controls(&world, id, 4.0F, -4.0F, -4.0F, -1.0F);
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+    EXPECT_TRUE(alife_find_organism(&world, id)->state == ALIFE_STATE_ASLEEP);
+    EXPECT_TRUE(!alife_transition_request(&world, id, ALIFE_STATE_ASLEEP, 0U,
+                                          error, sizeof(error)));
+    set_controls(&world, id, -4.0F, 4.0F, -4.0F, -1.0F);
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+    EXPECT_TRUE(alife_find_organism(&world, id)->state == ALIFE_STATE_AWAKE);
+    EXPECT_CALL(alife_transition_request(&world, id, ALIFE_STATE_ASLEEP, 0U,
+                                         error, sizeof(error)), error);
+    set_controls(&world, id, -4.0F, -4.0F, 4.0F, -1.0F);
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+    EXPECT_TRUE(alife_find_organism(&world, id)->state == ALIFE_STATE_OFF);
+    EXPECT_TRUE(alife_find_organism(&world, id)->back_on_tick == world.tick - 1U +
+                config.off_min_duration_ticks);
+    EXPECT_TRUE(!alife_transition_request(&world, id, ALIFE_STATE_AWAKE, 0U,
+                                          error, sizeof(error)));
+
+cleanup:
+    alife_world_destroy(&world);
+    return test_result_value;
+}
+
+static enum test_result test_sleep_and_off_disable_external_behavior(void)
+{
+    enum test_result test_result_value = TEST_PASS;
+    AlifeConfig config;
+    AlifeWorld world = {0};
+    char error[TEST_ERROR_SIZE] = {0};
+    uint64_t inactive_id;
+    uint64_t awake_id;
+    uint64_t executions;
+    float *inactive_slot;
+    const float *awake_slot;
+
+    prepare_config(&config);
+    EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)), error);
+    inactive_id = world.organisms[0].id;
+    awake_id = world.organisms[1].id;
+    EXPECT_CALL(alife_transition_request(&world, inactive_id, ALIFE_STATE_ASLEEP,
+                                         0U, error, sizeof(error)), error);
+    set_controls(&world, inactive_id, -4.0F, -4.0F, -4.0F, -1.0F);
+    inactive_slot = alife_organism_genome_mut(&world, inactive_id);
+    inactive_slot[world.layout.outbox] = 1.0F;
+    world.organisms[0].sent_message_this_tick = true;
+    make_reproduction_request(&world, inactive_id);
+    world.organisms[0].age = config.maturity_age;
+    EXPECT_TRUE(!alife_reproduction_eligible(&world, &world.organisms[0]));
+    EXPECT_TRUE(!alife_try_birth(&world, inactive_id, awake_id, true, error,
+                                 sizeof(error)));
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+    awake_slot = alife_organism_genome(&world, awake_id);
+    EXPECT_TRUE(awake_slot[world.layout.inbox] == 0.0F);
+    EXPECT_TRUE(alife_find_organism(&world, inactive_id)->reproduction_output ==
+                0.0F);
+
+    EXPECT_CALL(alife_transition_request(&world, inactive_id, ALIFE_STATE_OFF,
+                                         config.off_min_duration_ticks, error,
+                                         sizeof(error)), error);
+    executions = alife_find_organism(&world, inactive_id)->executions;
+    inactive_slot = alife_organism_genome_mut(&world, inactive_id);
+    inactive_slot[world.layout.outbox] = 1.0F;
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+    EXPECT_TRUE(alife_find_organism(&world, inactive_id)->executions == executions);
+    EXPECT_TRUE(!alife_reproduction_eligible(
+        &world, alife_find_organism(&world, inactive_id)));
+    awake_slot = alife_organism_genome(&world, awake_id);
+    EXPECT_TRUE(awake_slot[world.layout.inbox] == 0.0F);
+
+cleanup:
+    alife_world_destroy(&world);
+    return test_result_value;
+}
+
+static enum test_result test_plasticity_occurs_only_during_sleep(void)
+{
+    enum test_result test_result_value = TEST_PASS;
+    AlifeConfig config;
+    AlifeWorld world = {0};
+    char error[TEST_ERROR_SIZE] = {0};
+    uint64_t id;
+    double before;
+    double asleep_value;
+
+    prepare_config(&config);
+    EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)), error);
+    id = world.organisms[0].id;
+    set_controls(&world, id, -4.0F, -4.0F, -4.0F, -1.0F);
+    prepare_plastic_activity(&world, id);
+    before = plastic_state_sum(&world, id);
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+    EXPECT_TRUE(plastic_state_sum(&world, id) == before);
+    EXPECT_CALL(alife_transition_request(&world, id, ALIFE_STATE_ASLEEP, 0U,
+                                         error, sizeof(error)), error);
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+    asleep_value = plastic_state_sum(&world, id);
+    EXPECT_TRUE(asleep_value > before);
+    EXPECT_CALL(alife_transition_request(&world, id, ALIFE_STATE_OFF,
+                                         config.off_min_duration_ticks, error,
+                                         sizeof(error)), error);
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+    EXPECT_TRUE(plastic_state_sum(&world, id) == asleep_value);
+
+cleanup:
+    alife_world_destroy(&world);
+    return test_result_value;
+}
+
+static enum test_result test_off_timer_returns_to_sleep(void)
+{
+    enum test_result test_result_value = TEST_PASS;
+    AlifeConfig config;
+    AlifeWorld world = {0};
+    char error[TEST_ERROR_SIZE] = {0};
+    uint64_t id;
+    uint64_t execution_count;
+
+    prepare_config(&config);
+    config.off_min_duration_ticks = UINT64_C(2);
+    config.off_max_duration_ticks = UINT64_C(2);
+    EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)), error);
+    id = world.organisms[0].id;
+    EXPECT_CALL(alife_transition_request(&world, id, ALIFE_STATE_ASLEEP, 0U,
+                                         error, sizeof(error)), error);
+    set_controls(&world, id, -4.0F, -4.0F, -4.0F, -1.0F);
+    EXPECT_CALL(alife_transition_request(&world, id, ALIFE_STATE_OFF, 2U,
+                                         error, sizeof(error)), error);
+    execution_count = alife_find_organism(&world, id)->executions;
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+    EXPECT_TRUE(alife_find_organism(&world, id)->state == ALIFE_STATE_OFF);
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+    EXPECT_TRUE(alife_find_organism(&world, id)->state == ALIFE_STATE_ASLEEP);
+    EXPECT_TRUE(alife_find_organism(&world, id)->executions == execution_count + 1U);
+
+cleanup:
+    alife_world_destroy(&world);
+    return test_result_value;
+}
+
+static enum test_result test_foolsday_state_rules(void)
+{
+    enum test_result test_result_value = TEST_PASS;
+    AlifeConfig config;
+    AlifeWorld world = {0};
+    char error[TEST_ERROR_SIZE] = {0};
+    uint64_t awake_id;
+    uint64_t asleep_id;
+
+    prepare_config(&config);
     config.calendar_start_month = 4U;
     config.calendar_start_day = 1U;
-    config.ticks_per_day = UINT64_C(1);
-    config.april_1_behavior = ALIFE_APRIL_TERMINATE;
+    config.ticks_per_day = UINT64_C(10);
+    config.foolsday_sleep_death_probability = 0.0;
     EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)), error);
-    genome = alife_organism_genome_mut(&world, world.organisms[0].id);
-    EXPECT_TRUE(genome != NULL);
-    genome[0] = NAN;
-    world.organisms[0].reproduction_output = INFINITY;
-    world.organisms[0].acceptance_output = INFINITY;
-
+    awake_id = world.organisms[0].id;
+    asleep_id = world.organisms[1].id;
+    EXPECT_CALL(alife_transition_request(&world, asleep_id, ALIFE_STATE_ASLEEP,
+                                         0U, error, sizeof(error)), error);
+    set_controls(&world, asleep_id, -4.0F, -4.0F, -4.0F, -1.0F);
     EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
-    EXPECT_TRUE(world.count == 0U);
-    EXPECT_TRUE(world.total_executions == UINT64_C(0));
-    EXPECT_TRUE(world.total_deaths == UINT64_C(2));
+    EXPECT_TRUE(alife_find_organism(&world, awake_id) == NULL);
+    EXPECT_TRUE(alife_find_organism(&world, asleep_id) != NULL);
+    EXPECT_TRUE(alife_find_organism(&world, asleep_id)->executions == 1U);
 
 cleanup:
     alife_world_destroy(&world);
     return test_result_value;
 }
 
-static enum test_result test_april_second_reseeds_population(void)
+static enum test_result test_foolsday_sleep_probability_and_once_only(void)
+{
+    enum test_result test_result_value = TEST_PASS;
+    AlifeConfig survive_config;
+    AlifeConfig die_config;
+    AlifeWorld survive = {0};
+    AlifeWorld die = {0};
+    char error[TEST_ERROR_SIZE] = {0};
+    uint64_t survivor_id;
+    uint64_t rng_after_roll[4];
+
+    prepare_config(&survive_config);
+    survive_config.calendar_start_month = 4U;
+    survive_config.calendar_start_day = 1U;
+    survive_config.ticks_per_day = UINT64_C(10);
+    survive_config.foolsday_sleep_death_probability = 0.0;
+    die_config = survive_config;
+    die_config.foolsday_sleep_death_probability = 1.0;
+    EXPECT_CALL(alife_world_init(&survive, &survive_config, error,
+                                 sizeof(error)), error);
+    survivor_id = survive.organisms[0].id;
+    EXPECT_CALL(alife_transition_request(&survive, survivor_id,
+                                         ALIFE_STATE_ASLEEP, 0U, error,
+                                         sizeof(error)), error);
+    EXPECT_CALL(alife_transition_request(&survive, survive.organisms[1].id,
+                                         ALIFE_STATE_ASLEEP, 0U, error,
+                                         sizeof(error)), error);
+    set_controls(&survive, survivor_id, -4.0F, -4.0F, -4.0F, -1.0F);
+    set_controls(&survive, survive.organisms[1].id,
+                 -4.0F, -4.0F, -4.0F, -1.0F);
+    EXPECT_CALL(alife_world_step(&survive, error, sizeof(error)), error);
+    (void)memcpy(rng_after_roll, survive.rng.state, sizeof(rng_after_roll));
+    EXPECT_CALL(alife_world_step(&survive, error, sizeof(error)), error);
+    EXPECT_TRUE(memcmp(rng_after_roll, survive.rng.state,
+                       sizeof(rng_after_roll)) == 0);
+    EXPECT_TRUE(survive.count == 2U);
+
+    EXPECT_CALL(alife_world_init(&die, &die_config, error, sizeof(error)), error);
+    EXPECT_CALL(alife_transition_request(&die, die.organisms[0].id,
+                                         ALIFE_STATE_ASLEEP, 0U, error,
+                                         sizeof(error)), error);
+    EXPECT_CALL(alife_transition_request(&die, die.organisms[1].id,
+                                         ALIFE_STATE_ASLEEP, 0U, error,
+                                         sizeof(error)), error);
+    EXPECT_CALL(alife_world_step(&die, error, sizeof(error)), error);
+    EXPECT_TRUE(die.count == 0U);
+
+cleanup:
+    alife_world_destroy(&survive);
+    alife_world_destroy(&die);
+    return test_result_value;
+}
+
+static enum test_result test_foolsday_wake_dies_before_awake_execution(void)
 {
     enum test_result test_result_value = TEST_PASS;
     AlifeConfig config;
     AlifeWorld world = {0};
     char error[TEST_ERROR_SIZE] = {0};
+    uint64_t id;
 
     prepare_config(&config);
-    config.calendar_start_year = 2028U;
-    config.calendar_start_month = 3U;
-    config.calendar_start_day = 31U;
-    config.ticks_per_day = UINT64_C(1);
-    config.april_1_behavior = ALIFE_APRIL_RESEED;
+    config.calendar_start_month = 4U;
+    config.calendar_start_day = 1U;
+    config.ticks_per_day = UINT64_C(10);
+    config.foolsday_sleep_death_probability = 0.0;
     EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)), error);
-
+    id = world.organisms[0].id;
+    EXPECT_CALL(alife_transition_request(&world, id, ALIFE_STATE_ASLEEP, 0U,
+                                         error, sizeof(error)), error);
+    set_controls(&world, id, -4.0F, 4.0F, -4.0F, -1.0F);
+    EXPECT_CALL(alife_transition_request(&world, world.organisms[1].id,
+                                         ALIFE_STATE_ASLEEP, 0U, error,
+                                         sizeof(error)), error);
+    set_controls(&world, world.organisms[1].id,
+                 -4.0F, -4.0F, -4.0F, -1.0F);
     EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
-    EXPECT_TRUE(world.month == 4);
-    EXPECT_TRUE(world.day == 1);
-    EXPECT_TRUE(world.count == 0U);
-    EXPECT_TRUE(world.pending_reseed);
-    EXPECT_TRUE(world.total_executions == UINT64_C(0));
-
-    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
-    EXPECT_TRUE(world.month == 4);
-    EXPECT_TRUE(world.day == 2);
-    EXPECT_TRUE(world.count == 2U);
-    EXPECT_TRUE(!world.pending_reseed);
-    EXPECT_TRUE(world.total_births == UINT64_C(4));
+    EXPECT_TRUE(alife_find_organism(&world, id) == NULL);
     EXPECT_TRUE(world.total_executions == UINT64_C(2));
+
+cleanup:
+    alife_world_destroy(&world);
+    return test_result_value;
+}
+
+static enum test_result test_age_and_reward_advance_in_all_states(void)
+{
+    enum test_result test_result_value = TEST_PASS;
+    AlifeConfig config;
+    AlifeWorld world = {0};
+    char error[TEST_ERROR_SIZE] = {0};
+    uint64_t awake_id;
+    uint64_t inactive_id;
+
+    prepare_config(&config);
+    EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)), error);
+    awake_id = world.organisms[0].id;
+    inactive_id = world.organisms[1].id;
+    set_controls(&world, awake_id, -4.0F, -4.0F, -4.0F, -1.0F);
+    EXPECT_CALL(alife_transition_request(&world, inactive_id,
+                                         ALIFE_STATE_ASLEEP, 0U, error,
+                                         sizeof(error)), error);
+    set_controls(&world, inactive_id, -4.0F, -4.0F, -4.0F, -1.0F);
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+    EXPECT_TRUE(alife_find_organism(&world, awake_id)->age == UINT64_C(1));
+    EXPECT_TRUE(alife_find_organism(&world, inactive_id)->age == UINT64_C(1));
+    EXPECT_CALL(alife_transition_request(&world, inactive_id, ALIFE_STATE_OFF,
+                                         config.off_min_duration_ticks, error,
+                                         sizeof(error)), error);
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+    EXPECT_TRUE(alife_find_organism(&world, inactive_id)->age == UINT64_C(2));
+    EXPECT_TRUE(alife_find_organism(&world, inactive_id)->reward == UINT64_C(2));
+
+cleanup:
+    alife_world_destroy(&world);
+    return test_result_value;
+}
+
+static enum test_result test_foolsday_off_survival_and_expiry(void)
+{
+    enum test_result test_result_value = TEST_PASS;
+    AlifeConfig config;
+    AlifeWorld world = {0};
+    char error[TEST_ERROR_SIZE] = {0};
+    uint64_t off_id;
+
+    prepare_config(&config);
+    config.calendar_start_month = 4U;
+    config.calendar_start_day = 1U;
+    config.ticks_per_day = UINT64_C(10);
+    config.off_min_duration_ticks = UINT64_C(1);
+    config.off_max_duration_ticks = UINT64_C(1);
+    config.foolsday_sleep_death_probability = 0.0;
+    EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)), error);
+    off_id = world.organisms[0].id;
+    EXPECT_CALL(alife_transition_request(&world, off_id, ALIFE_STATE_ASLEEP,
+                                         0U, error, sizeof(error)), error);
+    set_controls(&world, off_id, -4.0F, -4.0F, -4.0F, -1.0F);
+    EXPECT_CALL(alife_transition_request(&world, off_id, ALIFE_STATE_OFF, 1U,
+                                         error, sizeof(error)), error);
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+    EXPECT_TRUE(alife_find_organism(&world, off_id)->state == ALIFE_STATE_OFF);
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+    EXPECT_TRUE(alife_find_organism(&world, off_id)->state == ALIFE_STATE_ASLEEP);
+    EXPECT_TRUE(alife_find_organism(&world, off_id)->last_foolsday_roll_year ==
+                world.year);
 
 cleanup:
     alife_world_destroy(&world);
@@ -514,6 +854,31 @@ static enum test_result test_checkpoint_resume_preserves_state(void)
                                  sizeof(error)),
                 error);
     EXPECT_CALL(alife_world_init(&split, &config, error, sizeof(error)), error);
+    EXPECT_CALL(alife_transition_request(&uninterrupted,
+                                         uninterrupted.organisms[0].id,
+                                         ALIFE_STATE_ASLEEP, 0U, error,
+                                         sizeof(error)), error);
+    EXPECT_CALL(alife_transition_request(&uninterrupted,
+                                         uninterrupted.organisms[0].id,
+                                         ALIFE_STATE_OFF, 50U, error,
+                                         sizeof(error)), error);
+    EXPECT_CALL(alife_transition_request(&split, split.organisms[0].id,
+                                         ALIFE_STATE_ASLEEP, 0U, error,
+                                         sizeof(error)), error);
+    EXPECT_CALL(alife_transition_request(&split, split.organisms[0].id,
+                                         ALIFE_STATE_OFF, 50U, error,
+                                         sizeof(error)), error);
+    EXPECT_CALL(alife_transition_request(&uninterrupted,
+                                         uninterrupted.organisms[1].id,
+                                         ALIFE_STATE_ASLEEP, 0U, error,
+                                         sizeof(error)), error);
+    EXPECT_CALL(alife_transition_request(&split, split.organisms[1].id,
+                                         ALIFE_STATE_ASLEEP, 0U, error,
+                                         sizeof(error)), error);
+    set_controls(&uninterrupted, uninterrupted.organisms[1].id,
+                 -4.0F, -4.0F, -4.0F, -1.0F);
+    set_controls(&split, split.organisms[1].id,
+                 -4.0F, -4.0F, -4.0F, -1.0F);
 
     for (step = 0U; step < 7U; ++step) {
         EXPECT_CALL(alife_world_step(&uninterrupted, error, sizeof(error)),
@@ -530,6 +895,9 @@ static enum test_result test_checkpoint_resume_preserves_state(void)
                                  sizeof(error)),
                 error);
     EXPECT_TRUE(alife_world_hash(&resumed) == checkpoint_hash);
+    EXPECT_TRUE(resumed.organisms[0].state == ALIFE_STATE_OFF);
+    EXPECT_TRUE(resumed.organisms[0].back_on_tick == UINT64_C(50));
+    EXPECT_TRUE(resumed.organisms[1].state == ALIFE_STATE_ASLEEP);
 
     for (step = 0U; step < 12U; ++step) {
         EXPECT_CALL(alife_world_step(&uninterrupted, error, sizeof(error)),
@@ -586,6 +954,56 @@ cleanup:
     return test_result_value;
 }
 
+static enum test_result test_lifecycle_observability_records(void)
+{
+    enum test_result test_result_value = TEST_PASS;
+    AlifeConfig config;
+    AlifeWorld world = {0};
+    char error[TEST_ERROR_SIZE] = {0};
+    char contents[8192] = {0};
+    FILE *log_file = NULL;
+    size_t bytes_read;
+
+    prepare_config(&config);
+    config.calendar_start_month = 4U;
+    config.calendar_start_day = 1U;
+    config.ticks_per_day = UINT64_C(10);
+    config.summary_interval = UINT64_C(1);
+    config.logging_level = ALIFE_LOG_EVENTS;
+    (void)remove(TEST_EVENT_PATH);
+    EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)), error);
+    EXPECT_CALL(alife_transition_request(&world, world.organisms[0].id,
+                                         ALIFE_STATE_ASLEEP, 0U, error,
+                                         sizeof(error)), error);
+    set_controls(&world, world.organisms[0].id,
+                 -4.0F, -4.0F, -4.0F, -1.0F);
+    EXPECT_CALL(alife_transition_request(&world, world.organisms[1].id,
+                                         ALIFE_STATE_ASLEEP, 0U, error,
+                                         sizeof(error)), error);
+    EXPECT_CALL(alife_transition_request(&world, world.organisms[1].id,
+                                         ALIFE_STATE_OFF,
+                                         config.off_min_duration_ticks, error,
+                                         sizeof(error)), error);
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+    log_file = fopen(TEST_EVENT_PATH, "rb");
+    EXPECT_TRUE(log_file != NULL);
+    bytes_read = fread(contents, 1U, sizeof(contents) - 1U, log_file);
+    contents[bytes_read] = '\0';
+    EXPECT_TRUE(strstr(contents, "\"event\":\"state_transition\"") != NULL);
+    EXPECT_TRUE(strstr(contents, "\"event\":\"foolsday_sleep_roll\"") !=
+                NULL);
+    EXPECT_TRUE(strstr(contents,
+                       "\"awake\":0,\"asleep\":1,\"off\":1") != NULL);
+
+cleanup:
+    if (log_file != NULL) {
+        (void)fclose(log_file);
+    }
+    alife_world_destroy(&world);
+    (void)remove(TEST_EVENT_PATH);
+    return test_result_value;
+}
+
 int main(void)
 {
     static const struct test_case tests[] = {
@@ -601,9 +1019,26 @@ int main(void)
          test_offspring_respects_neural_size_limits},
         {"capacity removes the oldest organism",
          test_capacity_removes_oldest_organism},
-        {"April 1 prevents execution", test_april_first_prevents_execution},
-        {"April 1 cannot be bypassed", test_april_first_cannot_be_bypassed},
-        {"April 2 reseeds the population", test_april_second_reseeds_population},
+        {"seeds and offspring begin awake",
+         test_initial_and_offspring_states_are_awake},
+        {"transition graph and control outputs are enforced",
+         test_transition_graph_and_control_outputs},
+        {"sleep and off disable external behavior",
+         test_sleep_and_off_disable_external_behavior},
+        {"plasticity occurs only during sleep",
+         test_plasticity_occurs_only_during_sleep},
+        {"off timer returns only to sleep",
+         test_off_timer_returns_to_sleep},
+        {"Fool's Day applies state-specific rules",
+         test_foolsday_state_rules},
+        {"Fool's Day sleep risk is evaluated once",
+         test_foolsday_sleep_probability_and_once_only},
+        {"waking on Fool's Day is fatal before awake execution",
+         test_foolsday_wake_dies_before_awake_execution},
+        {"off survives Fool's Day and expires into sleep",
+         test_foolsday_off_survival_and_expiry},
+        {"age and reward advance in every state",
+         test_age_and_reward_advance_in_all_states},
         {"pairing requires consent and opportunity",
          test_pair_requires_consent_and_opportunity},
         {"invalid neural values are rejected",
@@ -615,6 +1050,8 @@ int main(void)
          test_checkpoint_resume_preserves_state},
         {"checkpoint version is enforced",
          test_checkpoint_version_is_enforced},
+        {"lifecycle events and state summaries are observable",
+         test_lifecycle_observability_records},
     };
     const size_t test_count = sizeof(tests) / sizeof(tests[0]);
     size_t failures = 0U;

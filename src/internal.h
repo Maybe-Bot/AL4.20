@@ -26,7 +26,13 @@ void alife_log_plasticity(AlifeWorld *world, const AlifeOrganism *organism,
                           double magnitude);
 void alife_log_summary(AlifeWorld *world);
 void alife_log_checkpoint(AlifeWorld *world, const char *path);
-void alife_log_reseed(AlifeWorld *world);
+void alife_log_state_transition(AlifeWorld *world,
+                                const AlifeOrganism *organism,
+                                AlifeLifecycleState previous_state,
+                                uint64_t requested_off_duration);
+void alife_log_foolsday_sleep_roll(AlifeWorld *world,
+                                   const AlifeOrganism *organism,
+                                   double roll, bool survived);
 const char *alife_death_cause_name(AlifeDeathCause cause);
 
 #endif

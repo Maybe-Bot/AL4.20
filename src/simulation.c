@@ -67,7 +67,7 @@ bool alife_layout_create(const AlifeConfig *config, AlifeLayout *layout,
     layout->hidden_biases = cursor;
     cursor += hidden;
     layout->output_weights = cursor;
-    layout->output_count = communication + 2U;
+    layout->output_count = communication + ALIFE_NONCOMMUNICATION_OUTPUTS;
     cursor += layout->output_count * hidden;
     layout->output_biases = cursor;
     cursor += layout->output_count;
@@ -240,6 +240,10 @@ static void initialize_genome(AlifeWorld *world, float *genome) {
                 world->config.max_abs_weight : 0.5);
     genome[world->layout.output_biases + communication + 1U] =
         genome[world->layout.output_biases + communication];
+    for (i = communication + ALIFE_OUTPUT_SLEEP;
+         i < communication + ALIFE_NONCOMMUNICATION_OUTPUTS; ++i) {
+        genome[world->layout.output_biases + i] = 0.0F;
+    }
 }
 
 static bool append_organism(AlifeWorld *world, const float *genome,
@@ -271,6 +275,8 @@ static bool append_organism(AlifeWorld *world, const float *genome,
     organism->birth_year = world->year;
     organism->birth_month = world->month;
     organism->birth_day = world->day;
+    organism->state = ALIFE_STATE_AWAKE;
+    organism->last_foolsday_roll_year = INT32_MIN;
     slot = alife_slot(world, world->count);
     memset(slot, 0, world->layout.slot_floats * sizeof(*slot));
     memcpy(slot, genome, world->layout.genome_count * sizeof(*slot));
@@ -383,7 +389,6 @@ bool alife_setup_world(AlifeWorld *world, const AlifeConfig *config,
     world->year = (int32_t)config->calendar_start_year;
     world->month = (int32_t)config->calendar_start_month;
     world->day = (int32_t)config->calendar_start_day;
-    world->last_april_year = INT32_MIN;
     if (!open_event_log(world, log_mode, error, error_size)) {
         free(world->scratch_hidden);
         free(world->scratch_genome);
@@ -484,6 +489,106 @@ AlifeOrganism *alife_find_organism_mut(AlifeWorld *world, uint64_t id) {
     return index == SIZE_MAX ? NULL : &world->organisms[index];
 }
 
+const char *alife_lifecycle_state_name(AlifeLifecycleState state) {
+    switch (state) {
+        case ALIFE_STATE_AWAKE:
+            return "awake";
+        case ALIFE_STATE_ASLEEP:
+            return "asleep";
+        case ALIFE_STATE_OFF:
+            return "off";
+        default:
+            return "invalid";
+    }
+}
+
+static void clear_public_outputs(AlifeWorld *world, size_t index) {
+    AlifeOrganism *organism = &world->organisms[index];
+    float *slot = alife_slot(world, index);
+    size_t i;
+
+    organism->reproduction_output = 0.0F;
+    organism->acceptance_output = 0.0F;
+    organism->sent_message_this_tick = false;
+    for (i = 0U; i < (size_t)world->config.communication_size; ++i) {
+        slot[world->layout.inbox + i] = 0.0F;
+        slot[world->layout.outbox + i] = 0.0F;
+    }
+}
+
+static bool transition_at(AlifeWorld *world, size_t index,
+                          AlifeLifecycleState requested_state,
+                          uint64_t requested_off_duration,
+                          char *error, size_t error_size) {
+    AlifeOrganism *organism = &world->organisms[index];
+    AlifeLifecycleState previous_state = organism->state;
+    uint64_t duration = requested_off_duration;
+    bool allowed = false;
+
+    if (previous_state == ALIFE_STATE_AWAKE &&
+        requested_state == ALIFE_STATE_ASLEEP) {
+        allowed = true;
+    } else if (previous_state == ALIFE_STATE_ASLEEP &&
+               requested_state == ALIFE_STATE_AWAKE) {
+        allowed = true;
+    } else if (previous_state == ALIFE_STATE_ASLEEP &&
+               requested_state == ALIFE_STATE_OFF) {
+        allowed = true;
+        if (duration < world->config.off_min_duration_ticks) {
+            duration = world->config.off_min_duration_ticks;
+        }
+        if (duration > world->config.off_max_duration_ticks) {
+            duration = world->config.off_max_duration_ticks;
+        }
+        if (duration > UINT64_MAX - world->tick) {
+            alife_set_error(error, error_size,
+                            "The requested off timer would overflow.");
+            return false;
+        }
+    } else if (previous_state == ALIFE_STATE_OFF &&
+               requested_state == ALIFE_STATE_ASLEEP &&
+               world->tick >= organism->back_on_tick) {
+        allowed = true;
+        duration = 0U;
+    }
+    if (!allowed) {
+        alife_set_error(error, error_size, "Transition from %s to %s is not allowed.",
+                        alife_lifecycle_state_name(previous_state),
+                        alife_lifecycle_state_name(requested_state));
+        return false;
+    }
+
+    organism->state = requested_state;
+    organism->back_on_tick = requested_state == ALIFE_STATE_OFF ?
+                             world->tick + duration : 0U;
+    if (requested_state != ALIFE_STATE_AWAKE) {
+        clear_public_outputs(world, index);
+    }
+    alife_log_state_transition(world, organism, previous_state,
+                               requested_state == ALIFE_STATE_OFF ?
+                               requested_off_duration : 0U);
+    return true;
+}
+
+bool alife_transition_request(AlifeWorld *world, uint64_t organism_id,
+                              AlifeLifecycleState requested_state,
+                              uint64_t requested_off_duration,
+                              char *error, size_t error_size) {
+    size_t index;
+
+    if (world == NULL || !world->initialized) {
+        alife_set_error(error, error_size, "The world is not initialized.");
+        return false;
+    }
+    index = find_index(world, organism_id);
+    if (index == SIZE_MAX) {
+        alife_set_error(error, error_size, "The organism is not living.");
+        return false;
+    }
+    return transition_at(world, index, requested_state, requested_off_duration,
+                         error, error_size);
+}
+
 float *alife_organism_genome_mut(AlifeWorld *world, uint64_t id) {
     size_t index;
 
@@ -529,10 +634,22 @@ bool alife_organism_state_valid(const AlifeWorld *world, size_t index) {
     size_t i;
 
     if (organism->id == 0U ||
+        organism->state < ALIFE_STATE_AWAKE ||
+        organism->state > ALIFE_STATE_OFF ||
         !isfinite((double)organism->reproduction_output) ||
         !isfinite((double)organism->acceptance_output) ||
+        !isfinite((double)organism->sleep_output) ||
+        !isfinite((double)organism->wake_output) ||
+        !isfinite((double)organism->off_output) ||
+        !isfinite((double)organism->off_duration_output) ||
         fabs((double)organism->reproduction_output) > 1.0001 ||
-        fabs((double)organism->acceptance_output) > 1.0001) {
+        fabs((double)organism->acceptance_output) > 1.0001 ||
+        fabs((double)organism->sleep_output) > 1.0001 ||
+        fabs((double)organism->wake_output) > 1.0001 ||
+        fabs((double)organism->off_output) > 1.0001 ||
+        fabs((double)organism->off_duration_output) > 1.0001 ||
+        (organism->state == ALIFE_STATE_OFF &&
+         organism->back_on_tick <= world->tick)) {
         return false;
     }
     if (!alife_genome_validate(world, slot, NULL, 0U)) {
@@ -581,6 +698,7 @@ bool alife_reproduction_eligible(const AlifeWorld *world,
                                  const AlifeOrganism *organism) {
     return world != NULL && organism != NULL && !world->stopped &&
            !(world->month == 4 && world->day == 1) &&
+           organism->state == ALIFE_STATE_AWAKE &&
            organism->age >= world->config.maturity_age &&
            organism->reproduction_output > 0.0F &&
            organism->acceptance_output > 0.0F;
@@ -755,7 +873,7 @@ static void build_inputs(const AlifeWorld *world, size_t index, float *inputs) {
     }
 }
 
-static void execute_organism(AlifeWorld *world, size_t index) {
+static void execute_organism(AlifeWorld *world, size_t index, bool asleep) {
     size_t hidden = (size_t)world->config.hidden_size;
     size_t input_count = (size_t)world->config.input_size +
                          (size_t)world->config.communication_size;
@@ -768,12 +886,19 @@ static void execute_organism(AlifeWorld *world, size_t index) {
     size_t j;
     double plastic_magnitude = 0.0;
 
-    build_inputs(world, index, inputs);
+    if (asleep) {
+        memset(inputs, 0, input_count * sizeof(*inputs));
+    } else {
+        build_inputs(world, index, inputs);
+    }
     for (i = 0U; i < hidden; ++i) {
         double activation = (double)slot[world->layout.hidden_biases + i];
-        for (j = 0U; j < input_count; ++j) {
-            activation += (double)slot[world->layout.input_weights +
-                                      i * input_count + j] * (double)inputs[j];
+        if (!asleep) {
+            for (j = 0U; j < input_count; ++j) {
+                activation += (double)slot[world->layout.input_weights +
+                                          i * input_count + j] *
+                              (double)inputs[j];
+            }
         }
         for (j = 0U; j < hidden; ++j) {
             size_t edge = i * hidden + j;
@@ -791,38 +916,60 @@ static void execute_organism(AlifeWorld *world, size_t index) {
         }
         if (i < communication) {
             slot[world->layout.outbox + i] = (float)tanh(activation);
-        } else if (i == communication) {
-            world->organisms[index].reproduction_output = (float)tanh(activation);
         } else {
-            world->organisms[index].acceptance_output = (float)tanh(activation);
+            float output = (float)tanh(activation);
+            switch (i - communication) {
+                case ALIFE_OUTPUT_REPRODUCTION:
+                    world->organisms[index].reproduction_output = output;
+                    break;
+                case ALIFE_OUTPUT_ACCEPTANCE:
+                    world->organisms[index].acceptance_output = output;
+                    break;
+                case ALIFE_OUTPUT_SLEEP:
+                    world->organisms[index].sleep_output = output;
+                    break;
+                case ALIFE_OUTPUT_WAKE:
+                    world->organisms[index].wake_output = output;
+                    break;
+                case ALIFE_OUTPUT_OFF:
+                    world->organisms[index].off_output = output;
+                    break;
+                case ALIFE_OUTPUT_OFF_DURATION:
+                    world->organisms[index].off_duration_output = output;
+                    break;
+                default:
+                    break;
+            }
         }
     }
-    for (i = 0U; i < hidden; ++i) {
-        double rate = ALIFE_PLASTIC_RATE_SCALE *
-                      tanh((double)slot[world->layout.plastic_rates + i]);
-        double decay = clamp_double(
-            world->config.plasticity_decay +
-            0.01 * tanh((double)slot[world->layout.plastic_decays + i]),
-            0.0, 1.0);
-        for (j = 0U; j < hidden; ++j) {
-            size_t edge = i * hidden + j;
-            double old_value = (double)delta[edge];
-            double value = decay * old_value + rate * (double)state[j] *
-                           (double)world->scratch_hidden[i];
-            double base = (double)slot[world->layout.recurrent_weights + edge];
-            value = clamp_double(value, -world->config.plasticity_limit,
-                                 world->config.plasticity_limit);
-            value = clamp_double(value,
-                                 -world->config.max_abs_weight - base,
-                                 world->config.max_abs_weight - base);
-            delta[edge] = (float)value;
-            plastic_magnitude += fabs(value - old_value);
+    if (asleep) {
+        for (i = 0U; i < hidden; ++i) {
+            double rate = ALIFE_PLASTIC_RATE_SCALE *
+                          tanh((double)slot[world->layout.plastic_rates + i]);
+            double decay = clamp_double(
+                world->config.plasticity_decay +
+                0.01 * tanh((double)slot[world->layout.plastic_decays + i]),
+                0.0, 1.0);
+            for (j = 0U; j < hidden; ++j) {
+                size_t edge = i * hidden + j;
+                double old_value = (double)delta[edge];
+                double value = decay * old_value + rate * (double)state[j] *
+                               (double)world->scratch_hidden[i];
+                double base = (double)slot[world->layout.recurrent_weights + edge];
+                value = clamp_double(value, -world->config.plasticity_limit,
+                                     world->config.plasticity_limit);
+                value = clamp_double(value,
+                                     -world->config.max_abs_weight - base,
+                                     world->config.max_abs_weight - base);
+                delta[edge] = (float)value;
+                plastic_magnitude += fabs(value - old_value);
+            }
         }
     }
     memcpy(state, world->scratch_hidden, hidden * sizeof(*state));
     ++world->organisms[index].executions;
     ++world->total_executions;
-    if (plastic_magnitude >= ALIFE_SIGNIFICANT_PLASTICITY) {
+    if (asleep && plastic_magnitude >= ALIFE_SIGNIFICANT_PLASTICITY) {
         uint64_t *changes =
             &world->organisms[index].significant_weight_changes;
         if (*changes < UINT64_MAX) {
@@ -838,11 +985,17 @@ static void execute_organism(AlifeWorld *world, size_t index) {
 static void deliver_communication(AlifeWorld *world) {
     double sums[ALIFE_MAX_COMMUNICATION] = {0.0};
     size_t communication = (size_t)world->config.communication_size;
+    size_t senders = 0U;
     size_t i;
     size_t j;
 
     for (i = 0U; i < world->count; ++i) {
-        const float *slot = alife_slot_const(world, i);
+        const float *slot;
+        if (!world->organisms[i].sent_message_this_tick) {
+            continue;
+        }
+        slot = alife_slot_const(world, i);
+        ++senders;
         for (j = 0U; j < communication; ++j) {
             sums[j] += (double)slot[world->layout.outbox + j];
         }
@@ -850,12 +1003,15 @@ static void deliver_communication(AlifeWorld *world) {
     for (i = 0U; i < world->count; ++i) {
         float *slot = alife_slot(world, i);
         for (j = 0U; j < communication; ++j) {
-            if (world->count <= 1U) {
+            size_t peers = senders -
+                (world->organisms[i].sent_message_this_tick ? 1U : 0U);
+            if (world->organisms[i].state != ALIFE_STATE_AWAKE || peers == 0U) {
                 slot[world->layout.inbox + j] = 0.0F;
             } else {
                 slot[world->layout.inbox + j] = (float)(
-                    (sums[j] - (double)slot[world->layout.outbox + j]) /
-                    (double)(world->count - 1U));
+                    (sums[j] - (world->organisms[i].sent_message_this_tick ?
+                     (double)slot[world->layout.outbox + j] : 0.0)) /
+                    (double)peers);
             }
         }
     }
@@ -887,10 +1043,107 @@ static void process_reproduction(AlifeWorld *world) {
     }
 }
 
-static void kill_all(AlifeWorld *world, AlifeDeathCause cause) {
-    while (world->count > 0U) {
-        remove_at(world, world->count - 1U, cause);
+static uint64_t off_duration_from_output(const AlifeWorld *world, float output) {
+    uint64_t minimum = world->config.off_min_duration_ticks;
+    uint64_t span = world->config.off_max_duration_ticks - minimum;
+    const uint64_t scale = (uint64_t)UINT32_MAX;
+    double fraction = ((double)output + 1.0) * 0.5;
+    uint64_t scaled;
+    uint64_t quotient;
+    uint64_t remainder;
+    uint64_t mapped;
+
+    fraction = clamp_double(fraction, 0.0, 1.0);
+    scaled = (uint64_t)(fraction * (double)UINT32_MAX + 0.5);
+    quotient = span / scale;
+    remainder = span % scale;
+    mapped = quotient * scaled +
+             (remainder * scaled + scale / 2U) / scale;
+    if (mapped > span) {
+        mapped = span;
     }
+    return minimum + mapped;
+}
+
+static void process_off_timers(AlifeWorld *world) {
+    size_t i;
+    char ignored[128];
+
+    for (i = 0U; i < world->count; ++i) {
+        if (world->organisms[i].state == ALIFE_STATE_OFF &&
+            world->tick >= world->organisms[i].back_on_tick) {
+            (void)transition_at(world, i, ALIFE_STATE_ASLEEP, 0U,
+                                ignored, sizeof(ignored));
+        }
+    }
+}
+
+static void process_foolsday(AlifeWorld *world) {
+    size_t i = 0U;
+
+    if (world->month != 4 || world->day != 1) {
+        return;
+    }
+    while (i < world->count) {
+        AlifeOrganism *organism = &world->organisms[i];
+        if (organism->state == ALIFE_STATE_AWAKE) {
+            remove_at(world, i, ALIFE_DEATH_FOOLSDAY_AWAKE);
+        } else if (organism->state == ALIFE_STATE_ASLEEP &&
+                   organism->last_foolsday_roll_year != world->year) {
+            double roll = alife_rng_unit(&world->rng);
+            bool survived = roll >=
+                world->config.foolsday_sleep_death_probability;
+            organism->last_foolsday_roll_year = world->year;
+            alife_log_foolsday_sleep_roll(world, organism, roll, survived);
+            if (survived) {
+                ++i;
+            } else {
+                remove_at(world, i, ALIFE_DEATH_FOOLSDAY_SLEEP);
+            }
+        } else {
+            ++i;
+        }
+    }
+}
+
+static bool execute_lifecycle(AlifeWorld *world, size_t index) {
+    AlifeOrganism *organism = &world->organisms[index];
+    char ignored[128];
+
+    organism->sent_message_this_tick = false;
+    if (organism->state == ALIFE_STATE_OFF) {
+        return true;
+    }
+    if (organism->state == ALIFE_STATE_AWAKE) {
+        execute_organism(world, index, false);
+        organism->sent_message_this_tick = true;
+        if ((double)organism->sleep_output >
+            world->config.state_transition_threshold) {
+            (void)transition_at(world, index, ALIFE_STATE_ASLEEP, 0U,
+                                ignored, sizeof(ignored));
+        }
+        return true;
+    }
+
+    clear_public_outputs(world, index);
+    execute_organism(world, index, true);
+    clear_public_outputs(world, index);
+    if ((double)organism->off_output > world->config.state_transition_threshold &&
+        organism->off_output >= organism->wake_output) {
+        uint64_t duration = off_duration_from_output(
+            world, organism->off_duration_output);
+        (void)transition_at(world, index, ALIFE_STATE_OFF, duration,
+                            ignored, sizeof(ignored));
+    } else if ((double)organism->wake_output >
+               world->config.state_transition_threshold) {
+        (void)transition_at(world, index, ALIFE_STATE_AWAKE, 0U,
+                            ignored, sizeof(ignored));
+        if (world->month == 4 && world->day == 1) {
+            remove_at(world, index, ALIFE_DEATH_FOOLSDAY_AWAKE);
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool periodic_work(AlifeWorld *world, char *error, size_t error_size) {
@@ -909,6 +1162,13 @@ static bool periodic_work(AlifeWorld *world, char *error, size_t error_size) {
     return true;
 }
 
+static bool off_metadata_valid(const AlifeWorld *world, size_t index) {
+    const AlifeOrganism *organism = &world->organisms[index];
+
+    return organism->id != 0U && organism->state == ALIFE_STATE_OFF &&
+           organism->back_on_tick > world->tick;
+}
+
 bool alife_world_step(AlifeWorld *world, char *error, size_t error_size) {
     size_t i;
     uint64_t first_new_id;
@@ -924,19 +1184,8 @@ bool alife_world_step(AlifeWorld *world, char *error, size_t error_size) {
         alife_set_error(error, error_size, "The simulation tick counter is exhausted.");
         return false;
     }
-    if (world->month == 4 && world->day == 1 &&
-        (world->last_april_year != world->year || world->count > 0U)) {
-        kill_all(world, ALIFE_DEATH_APRIL_1);
-        world->last_april_year = world->year;
-        if (world->config.april_1_behavior == ALIFE_APRIL_TERMINATE) {
-            world->stopped = true;
-        } else {
-            world->pending_reseed = true;
-        }
-        ++world->tick;
-        return periodic_work(world, error, error_size);
-    }
-    if ((world->tick + 1U) % world->config.ticks_per_day == 0U) {
+    if (world->tick > 0U &&
+        world->tick % world->config.ticks_per_day == 0U) {
         if (world->year == 9999 && world->month == 12 && world->day == 31) {
             alife_set_error(error, error_size,
                             "The simulated calendar exceeded year 9999.");
@@ -944,34 +1193,25 @@ bool alife_world_step(AlifeWorld *world, char *error, size_t error_size) {
         }
         advance_date(world);
     }
-    if (world->month == 4 && world->day == 1) {
-        if (world->last_april_year != world->year || world->count > 0U) {
-            kill_all(world, ALIFE_DEATH_APRIL_1);
-            world->last_april_year = world->year;
-            if (world->config.april_1_behavior == ALIFE_APRIL_TERMINATE) {
-                world->stopped = true;
-            } else {
-                world->pending_reseed = true;
-            }
-        }
-        ++world->tick;
-        return periodic_work(world, error, error_size);
-    }
-    if (world->pending_reseed && world->month == 4 && world->day >= 2) {
-        if (!seed_population(world, error, error_size)) {
-            return false;
-        }
-        world->pending_reseed = false;
-        alife_log_reseed(world);
-    }
+    process_off_timers(world);
+    process_foolsday(world);
 
     i = 0U;
     while (i < world->count) {
-        if (!alife_organism_state_valid(world, i)) {
+        bool state_valid = world->organisms[i].state == ALIFE_STATE_OFF ?
+            off_metadata_valid(world, i) : alife_organism_state_valid(world, i);
+
+        if (!state_valid) {
             remove_at(world, i, ALIFE_DEATH_INVALID_STATE);
         } else {
-            execute_organism(world, i);
-            if (!alife_organism_state_valid(world, i)) {
+            bool remains = execute_lifecycle(world, i);
+            if (!remains) {
+                continue;
+            }
+            state_valid = world->organisms[i].state == ALIFE_STATE_OFF ?
+                off_metadata_valid(world, i) :
+                alife_organism_state_valid(world, i);
+            if (!state_valid) {
                 remove_at(world, i, ALIFE_DEATH_INVALID_STATE);
             } else {
                 ++i;

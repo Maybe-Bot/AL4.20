@@ -25,6 +25,10 @@ typedef enum {
     KEY_MUTATION_MAGNITUDE,
     KEY_PLASTICITY_LIMIT,
     KEY_PLASTICITY_DECAY,
+    KEY_FOOLSDAY_SLEEP_DEATH_PROBABILITY,
+    KEY_OFF_MIN_DURATION_TICKS,
+    KEY_OFF_MAX_DURATION_TICKS,
+    KEY_STATE_TRANSITION_THRESHOLD,
     KEY_CALENDAR_START_YEAR,
     KEY_CALENDAR_START_MONTH,
     KEY_CALENDAR_START_DAY,
@@ -35,7 +39,6 @@ typedef enum {
     KEY_CHECKPOINT_PATH,
     KEY_EVENT_LOG_PATH,
     KEY_LOGGING_LEVEL,
-    KEY_APRIL_1_BEHAVIOR,
     KEY_MAX_ABS_WEIGHT,
     KEY_COUNT
 } ConfigKey;
@@ -60,6 +63,11 @@ static const KeyDefinition KEY_DEFINITIONS[] = {
     {"mutation_magnitude", KEY_MUTATION_MAGNITUDE},
     {"plasticity_limit", KEY_PLASTICITY_LIMIT},
     {"plasticity_decay", KEY_PLASTICITY_DECAY},
+    {"foolsday_sleep_death_probability",
+     KEY_FOOLSDAY_SLEEP_DEATH_PROBABILITY},
+    {"off_min_duration_ticks", KEY_OFF_MIN_DURATION_TICKS},
+    {"off_max_duration_ticks", KEY_OFF_MAX_DURATION_TICKS},
+    {"state_transition_threshold", KEY_STATE_TRANSITION_THRESHOLD},
     {"calendar_start_year", KEY_CALENDAR_START_YEAR},
     {"calendar_start_month", KEY_CALENDAR_START_MONTH},
     {"calendar_start_day", KEY_CALENDAR_START_DAY},
@@ -70,7 +78,6 @@ static const KeyDefinition KEY_DEFINITIONS[] = {
     {"checkpoint_path", KEY_CHECKPOINT_PATH},
     {"event_log_path", KEY_EVENT_LOG_PATH},
     {"logging_level", KEY_LOGGING_LEVEL},
-    {"april_1_behavior", KEY_APRIL_1_BEHAVIOR},
     {"max_abs_weight", KEY_MAX_ABS_WEIGHT},
 };
 
@@ -248,6 +255,20 @@ static bool assign_value(AlifeConfig *config, const ConfigKey key,
         case KEY_PLASTICITY_DECAY:
             valid = parse_double_value(value, &config->plasticity_decay);
             break;
+        case KEY_FOOLSDAY_SLEEP_DEATH_PROBABILITY:
+            valid = parse_double_value(
+                value, &config->foolsday_sleep_death_probability);
+            break;
+        case KEY_OFF_MIN_DURATION_TICKS:
+            valid = parse_u64(value, &config->off_min_duration_ticks);
+            break;
+        case KEY_OFF_MAX_DURATION_TICKS:
+            valid = parse_u64(value, &config->off_max_duration_ticks);
+            break;
+        case KEY_STATE_TRANSITION_THRESHOLD:
+            valid = parse_double_value(
+                value, &config->state_transition_threshold);
+            break;
         case KEY_CALENDAR_START_YEAR:
             valid = parse_u32(value, &config->calendar_start_year);
             break;
@@ -286,15 +307,6 @@ static bool assign_value(AlifeConfig *config, const ConfigKey key,
             } else if (strcmp(value, "events") == 0 ||
                        strcmp(value, "2") == 0) {
                 config->logging_level = ALIFE_LOG_EVENTS;
-                valid = true;
-            }
-            break;
-        case KEY_APRIL_1_BEHAVIOR:
-            if (strcmp(value, "terminate") == 0) {
-                config->april_1_behavior = ALIFE_APRIL_TERMINATE;
-                valid = true;
-            } else if (strcmp(value, "reseed") == 0) {
-                config->april_1_behavior = ALIFE_APRIL_RESEED;
                 valid = true;
             }
             break;
@@ -400,6 +412,10 @@ void alife_config_defaults(AlifeConfig *config) {
     config->mutation_magnitude = 0.10;
     config->plasticity_limit = 0.05;
     config->plasticity_decay = 0.999;
+    config->foolsday_sleep_death_probability = 0.0;
+    config->off_min_duration_ticks = UINT64_C(10);
+    config->off_max_duration_ticks = UINT64_C(100000);
+    config->state_transition_threshold = 0.5;
     config->calendar_start_year = 2026U;
     config->calendar_start_month = 1U;
     config->calendar_start_day = 1U;
@@ -412,7 +428,6 @@ void alife_config_defaults(AlifeConfig *config) {
     (void)memcpy(config->event_log_path, "events.jsonl",
                  sizeof("events.jsonl"));
     config->logging_level = ALIFE_LOG_SUMMARY;
-    config->april_1_behavior = ALIFE_APRIL_TERMINATE;
     config->max_abs_weight = 4.0;
 }
 
@@ -444,9 +459,9 @@ bool alife_config_validate(const AlifeConfig *config, char *error,
              (uint64_t)config->communication_size) +
         (uint64_t)config->hidden_size * (uint64_t)config->hidden_size +
         (uint64_t)config->hidden_size +
-        ((uint64_t)config->communication_size + UINT64_C(2)) *
+        ((uint64_t)config->communication_size + UINT64_C(6)) *
             (uint64_t)config->hidden_size +
-        ((uint64_t)config->communication_size + UINT64_C(2)) +
+        ((uint64_t)config->communication_size + UINT64_C(6)) +
         UINT64_C(2) * (uint64_t)config->hidden_size;
     if (parameter_count < UINT64_C(500) ||
         parameter_count > UINT64_C(2000)) {
@@ -531,6 +546,29 @@ bool alife_config_validate(const AlifeConfig *config, char *error,
         return set_error(error, error_size,
                          "plasticity_decay must be between 0 and 1");
     }
+    if (!isfinite(config->foolsday_sleep_death_probability) ||
+        config->foolsday_sleep_death_probability < 0.0 ||
+        config->foolsday_sleep_death_probability > 1.0) {
+        return set_error(
+            error, error_size,
+            "foolsday_sleep_death_probability must be between 0 and 1");
+    }
+    if (config->off_min_duration_ticks == 0U) {
+        return set_error(error, error_size,
+                         "off_min_duration_ticks must be greater than zero");
+    }
+    if (config->off_max_duration_ticks < config->off_min_duration_ticks) {
+        return set_error(error, error_size,
+                         "off_max_duration_ticks must not be less than "
+                         "off_min_duration_ticks");
+    }
+    if (!isfinite(config->state_transition_threshold) ||
+        config->state_transition_threshold < 0.0 ||
+        config->state_transition_threshold >= 1.0) {
+        return set_error(error, error_size,
+                         "state_transition_threshold must be at least 0 and "
+                         "less than 1");
+    }
     if (config->calendar_start_year < 1U ||
         config->calendar_start_year > 9999U) {
         return set_error(error, error_size,
@@ -555,6 +593,10 @@ bool alife_config_validate(const AlifeConfig *config, char *error,
     if (config->tick_count == UINT64_C(0)) {
         return set_error(error, error_size,
                          "tick_count must be greater than zero");
+    }
+    if (config->tick_count > UINT64_MAX - config->off_max_duration_ticks) {
+        return set_error(error, error_size,
+                         "tick_count and off_max_duration_ticks are too large");
     }
     if (config->summary_interval == UINT64_C(0)) {
         return set_error(error, error_size,
@@ -586,12 +628,6 @@ bool alife_config_validate(const AlifeConfig *config, char *error,
         return set_error(error, error_size,
                          "logging_level must be error, summary, or events");
     }
-    if (config->april_1_behavior != ALIFE_APRIL_TERMINATE &&
-        config->april_1_behavior != ALIFE_APRIL_RESEED) {
-        return set_error(error, error_size,
-                         "april_1_behavior must be terminate or reseed");
-    }
-
     return true;
 }
 
@@ -740,6 +776,12 @@ bool alife_config_equal(const AlifeConfig *left, const AlifeConfig *right) {
            left->mutation_magnitude == right->mutation_magnitude &&
            left->plasticity_limit == right->plasticity_limit &&
            left->plasticity_decay == right->plasticity_decay &&
+           left->foolsday_sleep_death_probability ==
+               right->foolsday_sleep_death_probability &&
+           left->off_min_duration_ticks == right->off_min_duration_ticks &&
+           left->off_max_duration_ticks == right->off_max_duration_ticks &&
+           left->state_transition_threshold ==
+               right->state_transition_threshold &&
            left->calendar_start_year == right->calendar_start_year &&
            left->calendar_start_month == right->calendar_start_month &&
            left->calendar_start_day == right->calendar_start_day &&
@@ -752,7 +794,6 @@ bool alife_config_equal(const AlifeConfig *left, const AlifeConfig *right) {
            strncmp(left->event_log_path, right->event_log_path,
                    ALIFE_CONFIG_PATH_MAX) == 0 &&
            left->logging_level == right->logging_level &&
-           left->april_1_behavior == right->april_1_behavior &&
            left->max_abs_weight == right->max_abs_weight;
 }
 
@@ -777,6 +818,11 @@ uint64_t alife_config_fingerprint(const AlifeConfig *config) {
     hash = fingerprint_double(hash, config->mutation_magnitude);
     hash = fingerprint_double(hash, config->plasticity_limit);
     hash = fingerprint_double(hash, config->plasticity_decay);
+    hash = fingerprint_double(hash,
+                              config->foolsday_sleep_death_probability);
+    hash = fingerprint_u64(hash, config->off_min_duration_ticks);
+    hash = fingerprint_u64(hash, config->off_max_duration_ticks);
+    hash = fingerprint_double(hash, config->state_transition_threshold);
     hash = fingerprint_u64(hash, (uint64_t)config->calendar_start_year);
     hash = fingerprint_u64(hash, (uint64_t)config->calendar_start_month);
     hash = fingerprint_u64(hash, (uint64_t)config->calendar_start_day);
@@ -787,7 +833,6 @@ uint64_t alife_config_fingerprint(const AlifeConfig *config) {
     hash = fingerprint_path(hash, config->checkpoint_path);
     hash = fingerprint_path(hash, config->event_log_path);
     hash = fingerprint_u64(hash, (uint64_t)config->logging_level);
-    hash = fingerprint_u64(hash, (uint64_t)config->april_1_behavior);
     return fingerprint_double(hash, config->max_abs_weight);
 }
 

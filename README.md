@@ -17,15 +17,45 @@ organisms remain viable and evolve when age is the only explicit reward?
 - Substrate-provided age, reward, calendar, self-state, and communication
   inputs.
 - A small communication vector delivered by the host.
-- Bounded Hebbian changes to recurrent weights during an organism's life.
+- Bounded Hebbian changes to recurrent weights while an organism sleeps.
 - Sexual reproduction through per-gene recombination and bounded mutation.
 - A byte-based ecosystem capacity instead of a fixed population count.
-- An immutable rule that prevents execution and kills all organisms on
-  April 1.
+- An evolvable `AWAKE`, `ASLEEP`, and `OFF` lifecycle that determines how an
+  organism interacts, adapts internally, and survives April 1.
 - JSON Lines event logs, terminal summaries, and binary checkpoints.
 
 AL4.20 does not include arbitrary organism code, topology evolution,
 backpropagation, task rewards, a graphical world, GPU support, or networking.
+
+## Organism lifecycle
+
+The substrate owns each organism's state and accepts only these transitions:
+
+```text
+AWAKE -> ASLEEP -> OFF
+  ^         |       |
+  |         |       |
+  +---------+-------+
+        OFF returns only to ASLEEP
+```
+
+Awake is the interaction state: environmental and calendar inputs,
+communication, and reproduction are available, but neural plasticity is not.
+Sleep is the internal adaptation state: recurrent activity and bounded
+plasticity continue without fresh external inputs or externally visible
+outputs. Off is complete suspension: the network does not execute until its
+validated timer returns it to sleep.
+
+Age and survived-age reward advance in every state. Sleeping and off organisms
+also continue to consume capacity and can be displaced as the oldest organism.
+Seeds and offspring begin awake.
+
+On April 1, awake organisms die immediately. Sleeping organisms receive one
+deterministic death roll that day, using
+`foolsday_sleep_death_probability`; off organisms receive no roll. The example
+configurations use `0.0`, so an initial experiment only requires evolution to
+discover that remaining awake is fatal. Later experiments can increase the
+sleep risk to favor scheduled shutdown behavior.
 
 ## Build
 
@@ -108,19 +138,22 @@ calibration guidance.
 | `mutation_probability` | Independent probability of mutating a recombined gene. |
 | `mutation_magnitude` | Maximum absolute mutation step. |
 | `plasticity_limit` | Absolute bound for a lifetime recurrent-weight delta. |
-| `plasticity_decay` | Baseline per-tick retention factor for lifetime plasticity. |
+| `plasticity_decay` | Baseline per-sleep-step retention factor for lifetime plasticity. |
 | `max_abs_weight` | Absolute bound for neural weights. |
 | `calendar_start_year` | Initial simulated Gregorian year. |
 | `calendar_start_month` | Initial simulated month. |
 | `calendar_start_day` | Initial simulated day of month. |
 | `ticks_per_day` | Number of simulation ticks per calendar day. |
 | `tick_count` | Terminal tick for a new or resumed experiment. |
+| `foolsday_sleep_death_probability` | Per-organism probability of death while asleep on April 1, evaluated once that day. |
+| `off_min_duration_ticks` | Minimum accepted relative off duration in ticks. |
+| `off_max_duration_ticks` | Maximum accepted relative off duration in ticks. |
+| `state_transition_threshold` | Exclusive threshold for neural sleep, wake, and off requests. |
 | `summary_interval` | Positive tick interval for terminal and summary records. |
 | `checkpoint_interval` | Positive tick interval for scheduled checkpoints. |
 | `checkpoint_path` | Destination for scheduled binary checkpoints. |
 | `event_log_path` | Destination for JSONL events. |
 | `logging_level` | `error`, `summary`, or `events`. |
-| `april_1_behavior` | `terminate` to stop after extinction or `reseed` to create two seeds on the next permitted date. |
 
 Probabilities range from `0` through `1`. Sizes, paths, date fields, and numeric
 bounds are validated before any organism storage is allocated.
@@ -142,9 +175,10 @@ same-build reproducibility check.
    recurrent neural state, mutable recurrent weights, age and reward counters,
    a communication vector, and lineage metadata. The topology is fixed for a
    run.
-2. **Self-modification.** After network execution, a local Hebbian rule updates
-   eligible recurrent weights. Heritable coefficients control the rule. The
-   host clamps every update and weight to configured limits.
+2. **Self-modification.** During sleep execution, a local Hebbian rule updates
+   eligible recurrent weights. Awake and off organisms do not modify them.
+   Heritable coefficients control the rule, and the host clamps every update
+   and effective weight to configured limits.
 3. **Inheritance and mutation.** Each offspring needs two parents. The host
    independently selects or blends each gene from the parents, then applies
    probability-controlled, magnitude-bounded mutation and validates the result.
@@ -160,41 +194,42 @@ same-build reproducibility check.
 7. **Capacity-driven death.** Capacity is measured in bytes used by living
    organisms. After births, the host repeatedly removes the oldest organism
    until the population fits. Version 1 has no random old-age death.
-8. **April 1 enforcement.** The host advances the simulated calendar before
-   neural execution. On April 1, it kills all living organisms and executes
-   none. If configured, it seeds a new population after the date advances.
+8. **Fool's Day enforcement.** On April 1, the host kills awake organisms
+   before awake execution. Sleeping organisms face the configured once-per-day
+   risk, and off organisms remain protected. An off timer that expires that day
+   returns the organism to sleep and triggers its sleep risk.
 9. **Sandbox boundaries.** Organisms never run native code. They cannot access
    allocation functions, files, processes, networks, function pointers,
    arbitrary addresses, or host state. The C interpreter is the boundary; it
    is not a hardened parser for hostile checkpoint or configuration files.
 10. **Running and inspecting.** Start with `./scripts/run-small.sh`, watch the
     summaries on standard error, analyze the JSONL event file, and use
-    `alife inspect` to view checkpoint metadata and state totals.
+    `alife inspect` to view checkpoint metadata.
 
 ## Tick ordering
 
 Each tick uses a stable host-controlled order:
 
-1. Advance simulated time and derive the calendar date.
-2. Apply the April 1 gate. On April 1, kill all living organisms before any
-   network executes and skip the organism phases.
-3. Build each eligible organism's inputs from host state and its previously
-   delivered inbox.
-4. Execute its network once in deterministic population-array order.
-5. Apply and validate its bounded lifetime plasticity before moving to the next
-   organism.
-6. Deliver host-validated communication for the next input snapshot.
-7. Resolve reproduction requests and acceptances.
-8. Recombine, mutate, validate, and create approved offspring.
-9. Displace the oldest organisms until the byte capacity is satisfied, and
-   record all deaths and births.
+1. Advance the simulated date at a day boundary.
+2. Return expired off timers to sleep, then apply state-dependent April 1
+   policy before ordinary awake execution.
+3. Execute awake networks with environmental and communication inputs, or
+   asleep networks with recurrent state only. Skip off networks.
+4. Apply bounded lifetime plasticity only to sleeping networks.
+5. Validate and apply lifecycle requests. Waking on April 1 is fatal before an
+   awake step, message, or reproduction request.
+6. Deliver communication sent only by awake organisms to awake recipients.
+7. Resolve reproduction requests from awake organisms only.
+8. Recombine, mutate, validate, and create awake offspring.
+9. Displace the oldest organisms in any lifecycle state until capacity fits,
+   and record all deaths and births.
 10. Advance organism age and age reward, update statistics, emit scheduled
     records, and write a scheduled checkpoint.
 
 New offspring do not execute until the next tick. This ordering is part of the
 experiment definition. See [Architecture](docs/architecture.md) for details.
-The substrate also applies the April 1 gate to the configured starting date
-before the first calendar advance.
+The configured starting date applies to tick 0, so an April 1 start receives
+Fool's Day policy before any organism executes.
 
 ## Determinism and checkpoints
 

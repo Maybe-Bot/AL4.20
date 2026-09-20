@@ -3,9 +3,9 @@
 Version 1 uses one process and one deterministic execution thread. Measure the
 release build on the intended host before starting a long experiment.
 
-## Baseline profile
+## Create a baseline profile
 
-The bundled small configuration was profiled with GCC instrumentation:
+Profile the bundled small configuration with GCC instrumentation:
 
 ```sh
 make clean
@@ -14,18 +14,12 @@ build/alife run --config configs/small.conf
 gprof build/alife gmon.out
 ```
 
-In the development environment, the 2,000-tick run finished in less than one
-second. It reached 40 living organisms, produced 450 total births, and wrote an
-event log smaller than 1 MiB. Instrumentation can change floating-point code
-generation, so compare deterministic state hashes only between identical
-builds.
-
-The sampled CPU profile attributed about 47% of self time to the tick loop and
-its inlined neural and plasticity work. Full organism-state validation and
-genome-bound validation accounted for the remaining sampled time. Logging,
-checkpoint calls, capacity enforcement, and allocation did not register
-measurable self time at this small population. These percentages are a
-baseline, not a promise for a different compiler, population, or processor.
+Record the commit, compiler, flags, final state counts, and state hash with the
+profile. Lifecycle behavior changes the mix of awake neural execution, asleep
+plasticity, and low-cost off scheduling, so a result from an earlier lifecycle
+or configuration is not a comparable baseline. Instrumentation can also change
+floating-point code generation. Compare deterministic state hashes only
+between identical builds.
 
 ## Calibrate a long run
 

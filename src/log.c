@@ -59,8 +59,10 @@ const char *alife_death_cause_name(AlifeDeathCause cause) {
     switch (cause) {
         case ALIFE_DEATH_CAPACITY:
             return "capacity";
-        case ALIFE_DEATH_APRIL_1:
-            return "april_1";
+        case ALIFE_DEATH_FOOLSDAY_AWAKE:
+            return "foolsday_awake";
+        case ALIFE_DEATH_FOOLSDAY_SLEEP:
+            return "foolsday_sleep";
         case ALIFE_DEATH_INVALID_STATE:
             return "invalid_state";
         case ALIFE_DEATH_SHUTDOWN:
@@ -75,7 +77,7 @@ void alife_log_run_start(AlifeWorld *world) {
     }
     event_prefix(world, "run_start");
     (void)fprintf(world->event_log,
-                  ",\"log_version\":1,\"seed\":%" PRIu64
+                  ",\"log_version\":2,\"seed\":%" PRIu64
                   ",\"config_fingerprint\":%" PRIu64 ",\"resumed\":%s"
                   "}\n",
                   world->config.seed,
@@ -104,10 +106,11 @@ void alife_log_birth(AlifeWorld *world, const AlifeOrganism *organism) {
                   ",\"organism_id\":%" PRIu64 ",\"parent_a\":%" PRIu64
                   ",\"parent_b\":%" PRIu64 ",\"generation\":%" PRIu64
                   ",\"organism_bytes\":%zu,\"genome_parameters\":%zu"
-                  ",\"mutations\":%" PRIu64 "}\n",
+                  ",\"mutations\":%" PRIu64 ",\"state\":\"%s\"}\n",
                   organism->id, organism->parent_a, organism->parent_b,
                   organism->generation, alife_organism_size(world),
-                  world->layout.genome_count, organism->mutations);
+                  world->layout.genome_count, organism->mutations,
+                  alife_lifecycle_state_name(organism->state));
 }
 
 void alife_log_reproduction(AlifeWorld *world, uint64_t parent_a,
@@ -157,15 +160,34 @@ void alife_log_plasticity(AlifeWorld *world, const AlifeOrganism *organism,
 }
 
 void alife_log_summary(AlifeWorld *world) {
+    size_t awake = 0U;
+    size_t asleep = 0U;
+    size_t off = 0U;
+    size_t i;
+
+    for (i = 0U; i < world->count; ++i) {
+        switch (world->organisms[i].state) {
+            case ALIFE_STATE_AWAKE:
+                ++awake;
+                break;
+            case ALIFE_STATE_ASLEEP:
+                ++asleep;
+                break;
+            case ALIFE_STATE_OFF:
+                ++off;
+                break;
+        }
+    }
     if (world->config.logging_level >= ALIFE_LOG_SUMMARY) {
         (void)fprintf(stderr,
                       "tick=%" PRIu64 " date=%04" PRId32 "-%02" PRId32
                       "-%02" PRId32 " population=%zu mass=%" PRIu64
-                      " parameters=%zu"
+                      " parameters=%zu awake=%zu asleep=%zu off=%zu"
                       " births=%" PRIu64 " deaths=%" PRIu64 "\n",
                       world->tick, world->year, world->month, world->day,
                       world->count, world->population_bytes,
                       world->count * world->layout.genome_count,
+                      awake, asleep, off,
                       world->total_births, world->total_deaths);
     }
     if (!summaries_enabled(world)) {
@@ -175,11 +197,13 @@ void alife_log_summary(AlifeWorld *world) {
     (void)fprintf(world->event_log,
                   ",\"population\":%zu,\"population_bytes\":%" PRIu64
                   ",\"population_genome_parameters\":%zu"
+                  ",\"awake\":%zu,\"asleep\":%zu,\"off\":%zu"
                   ",\"births\":%" PRIu64 ",\"deaths\":%" PRIu64
                   ",\"reproduction_attempts\":%" PRIu64
                   ",\"mutations\":%" PRIu64 "}\n",
                   world->count, world->population_bytes,
                   world->count * world->layout.genome_count,
+                  awake, asleep, off,
                   world->total_births,
                   world->total_deaths, world->total_reproduction_attempts,
                   world->total_mutations);
@@ -210,10 +234,36 @@ void alife_log_checkpoint(AlifeWorld *world, const char *path) {
     (void)fflush(world->event_log);
 }
 
-void alife_log_reseed(AlifeWorld *world) {
+void alife_log_state_transition(AlifeWorld *world,
+                                const AlifeOrganism *organism,
+                                AlifeLifecycleState previous_state,
+                                uint64_t requested_off_duration) {
     if (!summaries_enabled(world)) {
         return;
     }
-    event_prefix(world, "reseed");
-    (void)fprintf(world->event_log, ",\"population\":%zu}\n", world->count);
+    event_prefix(world, "state_transition");
+    (void)fprintf(world->event_log,
+                  ",\"organism_id\":%" PRIu64
+                  ",\"previous_state\":\"%s\",\"new_state\":\"%s\""
+                  ",\"requested_off_duration\":%" PRIu64
+                  ",\"back_on_tick\":%" PRIu64 "}\n",
+                  organism->id, alife_lifecycle_state_name(previous_state),
+                  alife_lifecycle_state_name(organism->state),
+                  requested_off_duration, organism->back_on_tick);
+}
+
+void alife_log_foolsday_sleep_roll(AlifeWorld *world,
+                                   const AlifeOrganism *organism,
+                                   double roll, bool survived) {
+    if (!summaries_enabled(world)) {
+        return;
+    }
+    event_prefix(world, "foolsday_sleep_roll");
+    (void)fprintf(world->event_log,
+                  ",\"organism_id\":%" PRIu64
+                  ",\"roll\":%.17g,\"death_probability\":%.17g"
+                  ",\"outcome\":\"%s\"}\n",
+                  organism->id, roll,
+                  world->config.foolsday_sleep_death_probability,
+                  survived ? "survived" : "died");
 }

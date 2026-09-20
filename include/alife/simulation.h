@@ -9,15 +9,33 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define ALIFE_CHECKPOINT_VERSION 1U
+#define ALIFE_CHECKPOINT_VERSION 2U
 #define ALIFE_MIN_GENOME_PARAMETERS 500U
 #define ALIFE_MAX_GENOME_PARAMETERS 2000U
+#define ALIFE_PRIVATE_CONTROL_OUTPUTS 4U
+#define ALIFE_NONCOMMUNICATION_OUTPUTS 6U
+
+typedef enum {
+    ALIFE_STATE_AWAKE = 0,
+    ALIFE_STATE_ASLEEP = 1,
+    ALIFE_STATE_OFF = 2
+} AlifeLifecycleState;
+
+typedef enum {
+    ALIFE_OUTPUT_REPRODUCTION = 0,
+    ALIFE_OUTPUT_ACCEPTANCE = 1,
+    ALIFE_OUTPUT_SLEEP = 2,
+    ALIFE_OUTPUT_WAKE = 3,
+    ALIFE_OUTPUT_OFF = 4,
+    ALIFE_OUTPUT_OFF_DURATION = 5
+} AlifeOutputOffset;
 
 typedef enum {
     ALIFE_DEATH_CAPACITY = 0,
-    ALIFE_DEATH_APRIL_1 = 1,
-    ALIFE_DEATH_INVALID_STATE = 2,
-    ALIFE_DEATH_SHUTDOWN = 3
+    ALIFE_DEATH_FOOLSDAY_AWAKE = 1,
+    ALIFE_DEATH_FOOLSDAY_SLEEP = 2,
+    ALIFE_DEATH_INVALID_STATE = 3,
+    ALIFE_DEATH_SHUTDOWN = 4
 } AlifeDeathCause;
 
 typedef struct {
@@ -54,8 +72,16 @@ typedef struct {
     int32_t birth_year;
     int32_t birth_month;
     int32_t birth_day;
+    AlifeLifecycleState state;
+    uint64_t back_on_tick;
+    int32_t last_foolsday_roll_year;
     float reproduction_output;
     float acceptance_output;
+    float sleep_output;
+    float wake_output;
+    float off_output;
+    float off_duration_output;
+    bool sent_message_this_tick;
 } AlifeOrganism;
 
 typedef struct {
@@ -81,8 +107,6 @@ typedef struct {
     int32_t year;
     int32_t month;
     int32_t day;
-    int32_t last_april_year;
-    bool pending_reseed;
     bool stopped;
     bool initialized;
     FILE *event_log;
@@ -109,6 +133,11 @@ double alife_reproduction_probability(const AlifeWorld *world,
                                       const AlifeOrganism *organism);
 bool alife_reproduction_eligible(const AlifeWorld *world,
                                  const AlifeOrganism *organism);
+const char *alife_lifecycle_state_name(AlifeLifecycleState state);
+bool alife_transition_request(AlifeWorld *world, uint64_t organism_id,
+                              AlifeLifecycleState requested_state,
+                              uint64_t requested_off_duration,
+                              char *error, size_t error_size);
 bool alife_try_birth(AlifeWorld *world, uint64_t parent_a_id,
                      uint64_t parent_b_id, bool opportunity_granted,
                      char *error, size_t error_size);

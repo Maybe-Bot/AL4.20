@@ -56,8 +56,6 @@ static bool write_header(FILE *file, const AlifeWorld *world) {
         !write_i32(file, world->year) ||
         !write_i32(file, world->month) ||
         !write_i32(file, world->day) ||
-        !write_i32(file, world->last_april_year) ||
-        !write_u8(file, world->pending_reseed ? 1U : 0U) ||
         !write_u8(file, world->stopped ? 1U : 0U)) {
         return false;
     }
@@ -85,8 +83,15 @@ static bool write_organism(FILE *file, const AlifeOrganism *organism) {
            write_i32(file, organism->birth_year) &&
            write_i32(file, organism->birth_month) &&
            write_i32(file, organism->birth_day) &&
+           write_u32(file, (uint32_t)organism->state) &&
+           write_u64(file, organism->back_on_tick) &&
+           write_i32(file, organism->last_foolsday_roll_year) &&
            write_f32(file, organism->reproduction_output) &&
-           write_f32(file, organism->acceptance_output);
+           write_f32(file, organism->acceptance_output) &&
+           write_f32(file, organism->sleep_output) &&
+           write_f32(file, organism->wake_output) &&
+           write_f32(file, organism->off_output) &&
+           write_f32(file, organism->off_duration_output);
 }
 
 bool alife_world_save(AlifeWorld *world, const char *path,
@@ -177,8 +182,6 @@ typedef struct {
     int32_t year;
     int32_t month;
     int32_t day;
-    int32_t last_april_year;
-    uint8_t pending_reseed;
     uint8_t stopped;
     uint64_t rng[4];
 } CheckpointHeader;
@@ -212,8 +215,6 @@ static bool read_header(FILE *file, CheckpointHeader *header,
         !read_i32(file, &header->year) ||
         !read_i32(file, &header->month) ||
         !read_i32(file, &header->day) ||
-        !read_i32(file, &header->last_april_year) ||
-        !read_u8(file, &header->pending_reseed) ||
         !read_u8(file, &header->stopped)) {
         alife_set_error(error, error_size, "The checkpoint header is truncated.");
         return false;
@@ -239,7 +240,11 @@ static bool read_header(FILE *file, CheckpointHeader *header,
 }
 
 static bool read_organism(FILE *file, AlifeOrganism *organism) {
-    return read_u64(file, &organism->id) &&
+    uint32_t state;
+    bool okay;
+
+    memset(organism, 0, sizeof(*organism));
+    okay = read_u64(file, &organism->id) &&
            read_u64(file, &organism->parent_a) &&
            read_u64(file, &organism->parent_b) &&
            read_u64(file, &organism->birth_tick) &&
@@ -254,8 +259,19 @@ static bool read_organism(FILE *file, AlifeOrganism *organism) {
            read_i32(file, &organism->birth_year) &&
            read_i32(file, &organism->birth_month) &&
            read_i32(file, &organism->birth_day) &&
+           read_u32(file, &state) &&
+           read_u64(file, &organism->back_on_tick) &&
+           read_i32(file, &organism->last_foolsday_roll_year) &&
            read_f32(file, &organism->reproduction_output) &&
-           read_f32(file, &organism->acceptance_output);
+           read_f32(file, &organism->acceptance_output) &&
+           read_f32(file, &organism->sleep_output) &&
+           read_f32(file, &organism->wake_output) &&
+           read_f32(file, &organism->off_output) &&
+           read_f32(file, &organism->off_duration_output);
+    if (okay) {
+        organism->state = (AlifeLifecycleState)state;
+    }
+    return okay;
 }
 
 static void abandon_world(AlifeWorld *world) {
@@ -323,16 +339,11 @@ bool alife_world_load(AlifeWorld *world, const AlifeConfig *config,
         return false;
     }
     if (!checkpoint_date_valid(header.year, header.month, header.day) ||
-        header.pending_reseed > 1U || header.stopped > 1U ||
+        header.stopped > 1U ||
         header.next_id == 0U || header.next_id != header.births + 1U ||
         header.tick > config->tick_count || header.deaths > header.births ||
         header.count != header.births - header.deaths ||
-        (header.rng[0] | header.rng[1] | header.rng[2] | header.rng[3]) == 0U ||
-        (header.last_april_year != INT32_MIN &&
-         (header.last_april_year < 1 || header.last_april_year > header.year)) ||
-        (header.pending_reseed != 0U &&
-         (header.count != 0U || header.month != 4 || header.day != 1)) ||
-        (header.stopped != 0U && header.count != 0U)) {
+        (header.rng[0] | header.rng[1] | header.rng[2] | header.rng[3]) == 0U) {
         alife_set_error(error, error_size,
                         "The checkpoint contains invalid substrate state.");
         (void)fclose(file);
@@ -366,8 +377,16 @@ bool alife_world_load(AlifeWorld *world, const AlifeConfig *config,
                                    world->organisms[i].birth_day) ||
             world->organisms[i].id >= header.next_id ||
             world->organisms[i].birth_tick > header.tick ||
-            world->organisms[i].age != world->organisms[i].executions ||
             world->organisms[i].reward != world->organisms[i].age ||
+            (world->organisms[i].state == ALIFE_STATE_OFF &&
+             (world->organisms[i].back_on_tick <= header.tick ||
+              world->organisms[i].back_on_tick >
+                  config->tick_count + config->off_max_duration_ticks)) ||
+            (world->organisms[i].state != ALIFE_STATE_OFF &&
+             world->organisms[i].back_on_tick != 0U) ||
+            (world->organisms[i].last_foolsday_roll_year != INT32_MIN &&
+             (world->organisms[i].last_foolsday_roll_year < 1 ||
+              world->organisms[i].last_foolsday_roll_year > header.year)) ||
             world->organisms[i].mutations >
                 (uint64_t)world->layout.genome_count ||
             world->organisms[i].significant_weight_changes >
@@ -421,8 +440,6 @@ bool alife_world_load(AlifeWorld *world, const AlifeConfig *config,
     world->year = header.year;
     world->month = header.month;
     world->day = header.day;
-    world->last_april_year = header.last_april_year;
-    world->pending_reseed = header.pending_reseed != 0U;
     world->stopped = header.stopped != 0U;
     for (i = 0U; i < 4U; ++i) {
         world->rng.state[i] = header.rng[i];
@@ -500,8 +517,6 @@ uint64_t alife_world_hash(const AlifeWorld *world) {
     HASH_FIELD(hash, world, year);
     HASH_FIELD(hash, world, month);
     HASH_FIELD(hash, world, day);
-    HASH_FIELD(hash, world, last_april_year);
-    HASH_FIELD(hash, world, pending_reseed);
     HASH_FIELD(hash, world, stopped);
     hash = hash_bytes(hash, world->rng.state, sizeof(world->rng.state));
     for (i = 0U; i < world->count; ++i) {
@@ -521,8 +536,15 @@ uint64_t alife_world_hash(const AlifeWorld *world) {
         HASH_FIELD(hash, organism, birth_year);
         HASH_FIELD(hash, organism, birth_month);
         HASH_FIELD(hash, organism, birth_day);
+        HASH_FIELD(hash, organism, state);
+        HASH_FIELD(hash, organism, back_on_tick);
+        HASH_FIELD(hash, organism, last_foolsday_roll_year);
         HASH_FIELD(hash, organism, reproduction_output);
         HASH_FIELD(hash, organism, acceptance_output);
+        HASH_FIELD(hash, organism, sleep_output);
+        HASH_FIELD(hash, organism, wake_output);
+        HASH_FIELD(hash, organism, off_output);
+        HASH_FIELD(hash, organism, off_duration_output);
         hash = hash_bytes(hash, alife_slot_const(world, i),
                           world->layout.slot_floats * sizeof(float));
     }

@@ -19,12 +19,6 @@ typedef enum {
     ALIFE_LOG_EVENTS = 2
 } AlifeLoggingLevel;
 
-/** Selects what happens after the substrate enters April 1. */
-typedef enum {
-    ALIFE_APRIL_TERMINATE = 0,
-    ALIFE_APRIL_RESEED = 1
-} AlifeAprilBehavior;
-
 /** Contains all user-configurable experiment parameters. */
 typedef struct {
     uint64_t seed;
@@ -41,6 +35,10 @@ typedef struct {
     double mutation_magnitude;
     double plasticity_limit;
     double plasticity_decay;
+    double foolsday_sleep_death_probability;
+    uint64_t off_min_duration_ticks;
+    uint64_t off_max_duration_ticks;
+    double state_transition_threshold;
     uint32_t calendar_start_year;
     uint32_t calendar_start_month;
     uint32_t calendar_start_day;
@@ -51,7 +49,6 @@ typedef struct {
     char checkpoint_path[ALIFE_CONFIG_PATH_MAX];
     char event_log_path[ALIFE_CONFIG_PATH_MAX];
     AlifeLoggingLevel logging_level;
-    AlifeAprilBehavior april_1_behavior;
     double max_abs_weight;
 } AlifeConfig;
 
