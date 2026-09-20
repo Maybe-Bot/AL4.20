@@ -1,0 +1,32 @@
+# Build output
+/build/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Experiment output
+*.chk
+*.checkpoint
+*.jsonl
+*.log
+core
+core.*
+
+# Coverage and profiling
+*.gcda
+*.gcno
+*.gcov
+*.profraw
+*.profdata
+gmon.out
+
+# Editors and operating systems
+*~
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/

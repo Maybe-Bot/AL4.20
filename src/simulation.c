@@ -1,0 +1,1012 @@
+#include "internal.h"
+#include "alife/reward.h"
+
+#include <errno.h>
+#include <float.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define ALIFE_MAX_INPUTS 40U
+#define ALIFE_MAX_HIDDEN 64U
+#define ALIFE_MAX_COMMUNICATION 8U
+#define ALIFE_PLASTIC_RATE_SCALE 0.05
+#define ALIFE_SIGNIFICANT_PLASTICITY 0.01
+
+void alife_set_error(char *error, size_t error_size, const char *format, ...) {
+    va_list arguments;
+
+    if (error == NULL || error_size == 0U) {
+        return;
+    }
+    va_start(arguments, format);
+    (void)vsnprintf(error, error_size, format, arguments);
+    va_end(arguments);
+}
+
+static double clamp_double(double value, double minimum, double maximum) {
+    if (value < minimum) {
+        return minimum;
+    }
+    if (value > maximum) {
+        return maximum;
+    }
+    return value;
+}
+
+bool alife_layout_create(const AlifeConfig *config, AlifeLayout *layout,
+                         char *error, size_t error_size) {
+    size_t cursor = 0U;
+    size_t hidden;
+    size_t inputs;
+    size_t communication;
+
+    if (config == NULL || layout == NULL) {
+        alife_set_error(error, error_size, "The layout arguments must not be null.");
+        return false;
+    }
+    hidden = (size_t)config->hidden_size;
+    communication = (size_t)config->communication_size;
+    inputs = (size_t)config->input_size + communication;
+    if (hidden > ALIFE_MAX_HIDDEN || inputs > ALIFE_MAX_INPUTS ||
+        communication > ALIFE_MAX_COMMUNICATION) {
+        alife_set_error(error, error_size, "The neural dimensions exceed runtime limits.");
+        return false;
+    }
+
+    memset(layout, 0, sizeof(*layout));
+    layout->input_weights = cursor;
+    cursor += hidden * inputs;
+    layout->recurrent_weights = cursor;
+    layout->recurrent_count = hidden * hidden;
+    cursor += layout->recurrent_count;
+    layout->hidden_biases = cursor;
+    cursor += hidden;
+    layout->output_weights = cursor;
+    layout->output_count = communication + 2U;
+    cursor += layout->output_count * hidden;
+    layout->output_biases = cursor;
+    cursor += layout->output_count;
+    layout->plastic_rates = cursor;
+    cursor += hidden;
+    layout->plastic_decays = cursor;
+    cursor += hidden;
+    layout->genome_count = cursor;
+    if (cursor < ALIFE_MIN_GENOME_PARAMETERS ||
+        cursor > ALIFE_MAX_GENOME_PARAMETERS) {
+        alife_set_error(error, error_size,
+                        "The architecture has %zu genome parameters; use %u to %u.",
+                        cursor, ALIFE_MIN_GENOME_PARAMETERS,
+                        ALIFE_MAX_GENOME_PARAMETERS);
+        return false;
+    }
+    layout->plastic_state = cursor;
+    cursor += layout->recurrent_count;
+    layout->hidden_state = cursor;
+    cursor += hidden;
+    layout->inbox = cursor;
+    cursor += communication;
+    layout->outbox = cursor;
+    cursor += communication;
+    layout->slot_floats = cursor;
+    return true;
+}
+
+size_t alife_organism_size(const AlifeWorld *world) {
+    if (world == NULL) {
+        return 0U;
+    }
+    return sizeof(AlifeOrganism) + world->layout.slot_floats * sizeof(float);
+}
+
+float *alife_slot(AlifeWorld *world, size_t index) {
+    return world->data + index * world->layout.slot_floats;
+}
+
+const float *alife_slot_const(const AlifeWorld *world, size_t index) {
+    return world->data + index * world->layout.slot_floats;
+}
+
+bool alife_reserve(AlifeWorld *world, size_t needed, char *error,
+                   size_t error_size) {
+    size_t capacity;
+    size_t slot_bytes;
+    AlifeOrganism *new_organisms;
+    float *new_data;
+    uint64_t *new_scratch;
+
+    if (needed <= world->slot_capacity && needed <= world->scratch_capacity) {
+        return true;
+    }
+    capacity = world->slot_capacity == 0U ? 4U : world->slot_capacity;
+    while (capacity < needed) {
+        if (capacity > SIZE_MAX / 2U) {
+            alife_set_error(error, error_size, "The population allocation is too large.");
+            return false;
+        }
+        capacity *= 2U;
+    }
+    if (world->layout.slot_floats > SIZE_MAX / sizeof(*new_data)) {
+        alife_set_error(error, error_size, "The neural-state slot is too large.");
+        return false;
+    }
+    slot_bytes = world->layout.slot_floats * sizeof(*new_data);
+    if (capacity > SIZE_MAX / sizeof(*new_organisms) ||
+        capacity > SIZE_MAX / sizeof(*new_scratch) ||
+        (slot_bytes != 0U && capacity > SIZE_MAX / slot_bytes)) {
+        alife_set_error(error, error_size, "The neural-state allocation is too large.");
+        return false;
+    }
+    new_organisms = malloc(capacity * sizeof(*new_organisms));
+    new_data = malloc(capacity * slot_bytes);
+    new_scratch = malloc(capacity * sizeof(*new_scratch));
+    if (new_organisms == NULL || new_data == NULL || new_scratch == NULL) {
+        free(new_organisms);
+        free(new_data);
+        free(new_scratch);
+        alife_set_error(error, error_size,
+                        "Could not allocate space for %zu organisms.", capacity);
+        return false;
+    }
+    if (world->count > 0U) {
+        memcpy(new_organisms, world->organisms,
+               world->count * sizeof(*new_organisms));
+        memcpy(new_data, world->data,
+               world->count * world->layout.slot_floats * sizeof(*new_data));
+        memcpy(new_scratch, world->scratch_ids,
+               world->count * sizeof(*new_scratch));
+    }
+    free(world->organisms);
+    free(world->data);
+    free(world->scratch_ids);
+    world->organisms = new_organisms;
+    world->data = new_data;
+    world->scratch_ids = new_scratch;
+    world->slot_capacity = capacity;
+    world->scratch_capacity = capacity;
+    return true;
+}
+
+static int days_in_month(int32_t year, int32_t month) {
+    static const int days[] = {31, 28, 31, 30, 31, 30,
+                               31, 31, 30, 31, 30, 31};
+    int result = days[month - 1];
+    bool leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+
+    if (month == 2 && leap) {
+        result = 29;
+    }
+    return result;
+}
+
+static void advance_date(AlifeWorld *world) {
+    ++world->day;
+    if (world->day > days_in_month(world->year, world->month)) {
+        world->day = 1;
+        ++world->month;
+        if (world->month > 12) {
+            world->month = 1;
+            ++world->year;
+        }
+    }
+}
+
+static bool open_event_log(AlifeWorld *world, const char *mode,
+                           char *error, size_t error_size) {
+    if (world->config.logging_level < ALIFE_LOG_SUMMARY ||
+        world->config.event_log_path[0] == '\0') {
+        return true;
+    }
+    world->event_log = fopen(world->config.event_log_path, mode);
+    if (world->event_log == NULL) {
+        alife_set_error(error, error_size, "Could not open event log '%s': %s.",
+                        world->config.event_log_path, strerror(errno));
+        return false;
+    }
+    (void)setvbuf(world->event_log, NULL, _IOFBF, 64U * 1024U);
+    return true;
+}
+
+static void initialize_genome(AlifeWorld *world, float *genome) {
+    size_t i;
+    size_t hidden = (size_t)world->config.hidden_size;
+    size_t communication = (size_t)world->config.communication_size;
+    double scale = 1.0 / sqrt((double)hidden);
+    double plastic_scale;
+
+    if (scale > world->config.max_abs_weight) {
+        scale = world->config.max_abs_weight;
+    }
+    plastic_scale = world->config.max_abs_weight < 0.1 ?
+                    world->config.max_abs_weight : 0.1;
+
+    for (i = 0U; i < world->layout.genome_count; ++i) {
+        genome[i] = (float)(alife_rng_symmetric(&world->rng) * scale);
+    }
+    for (i = 0U; i < hidden; ++i) {
+        genome[world->layout.plastic_rates + i] =
+            (float)(alife_rng_symmetric(&world->rng) * plastic_scale);
+        genome[world->layout.plastic_decays + i] = 0.0F;
+    }
+    for (i = 0U; i < communication; ++i) {
+        genome[world->layout.output_biases + i] = 0.0F;
+    }
+    genome[world->layout.output_biases + communication] =
+        (float)(world->config.max_abs_weight < 0.5 ?
+                world->config.max_abs_weight : 0.5);
+    genome[world->layout.output_biases + communication + 1U] =
+        genome[world->layout.output_biases + communication];
+}
+
+static bool append_organism(AlifeWorld *world, const float *genome,
+                            uint64_t parent_a, uint64_t parent_b,
+                            uint64_t generation, uint64_t mutations,
+                            char *error, size_t error_size) {
+    AlifeOrganism *organism;
+    float *slot;
+
+    size_t organism_bytes = alife_organism_size(world);
+
+    if (world->count == SIZE_MAX ||
+        (organism_bytes != 0U &&
+         world->count + 1U > UINT64_MAX / (uint64_t)organism_bytes)) {
+        alife_set_error(error, error_size, "The population byte count would overflow.");
+        return false;
+    }
+    if (!alife_reserve(world, world->count + 1U, error, error_size)) {
+        return false;
+    }
+    organism = &world->organisms[world->count];
+    memset(organism, 0, sizeof(*organism));
+    organism->id = world->next_id++;
+    organism->parent_a = parent_a;
+    organism->parent_b = parent_b;
+    organism->birth_tick = world->tick;
+    organism->generation = generation;
+    organism->mutations = mutations;
+    organism->birth_year = world->year;
+    organism->birth_month = world->month;
+    organism->birth_day = world->day;
+    slot = alife_slot(world, world->count);
+    memset(slot, 0, world->layout.slot_floats * sizeof(*slot));
+    memcpy(slot, genome, world->layout.genome_count * sizeof(*slot));
+    ++world->count;
+    ++world->total_births;
+    world->total_mutations += mutations;
+    world->population_bytes =
+        (uint64_t)world->count * (uint64_t)organism_bytes;
+    alife_log_birth(world, organism);
+    return true;
+}
+
+static bool seed_population(AlifeWorld *world, char *error, size_t error_size) {
+    float *base;
+    float *related;
+    size_t i;
+    uint64_t mutations = 0U;
+    double probability = world->config.mutation_probability;
+
+    base = malloc(world->layout.genome_count * sizeof(*base));
+    related = malloc(world->layout.genome_count * sizeof(*related));
+    if (base == NULL || related == NULL) {
+        free(base);
+        free(related);
+        alife_set_error(error, error_size, "Could not allocate seed genomes.");
+        return false;
+    }
+    initialize_genome(world, base);
+    memcpy(related, base, world->layout.genome_count * sizeof(*related));
+    if (probability < 0.02) {
+        probability = 0.02;
+    }
+    for (i = 0U; i < world->layout.genome_count; ++i) {
+        if (alife_rng_unit(&world->rng) < probability) {
+            float old_value = related[i];
+            double value = (double)related[i] +
+                alife_rng_symmetric(&world->rng) * world->config.mutation_magnitude;
+            related[i] = (float)clamp_double(value,
+                                             -world->config.max_abs_weight,
+                                             world->config.max_abs_weight);
+            if (related[i] != old_value) {
+                ++mutations;
+            }
+        }
+    }
+    if (mutations == 0U) {
+        size_t position = (size_t)alife_rng_bounded(
+            &world->rng, (uint64_t)world->layout.genome_count);
+        if (related[position] != 0.0F) {
+            related[position] = -related[position];
+        } else {
+            related[position] = (float)(0.5 * world->config.max_abs_weight);
+        }
+        mutations = 1U;
+    }
+    if (!alife_genome_validate(world, base, error, error_size) ||
+        !alife_genome_validate(world, related, error, error_size)) {
+        free(base);
+        free(related);
+        return false;
+    }
+    if (!append_organism(world, base, 0U, 0U, 0U, 0U, error, error_size) ||
+        !append_organism(world, related, 0U, 0U, 0U, mutations,
+                         error, error_size)) {
+        free(base);
+        free(related);
+        return false;
+    }
+    free(base);
+    free(related);
+    return true;
+}
+
+bool alife_setup_world(AlifeWorld *world, const AlifeConfig *config,
+                       const char *log_mode, bool add_seeds,
+                       char *error, size_t error_size) {
+    if (world == NULL || config == NULL) {
+        alife_set_error(error, error_size, "The world arguments must not be null.");
+        return false;
+    }
+    memset(world, 0, sizeof(*world));
+    if (!alife_config_validate(config, error, error_size)) {
+        return false;
+    }
+    world->config = *config;
+    if (!alife_layout_create(config, &world->layout, error, error_size)) {
+        return false;
+    }
+    if ((uint64_t)alife_organism_size(world) >
+        config->capacity_bytes / (uint64_t)config->initial_population) {
+        alife_set_error(error, error_size,
+                        "Capacity must hold the two seed organisms (%zu bytes each).",
+                        alife_organism_size(world));
+        return false;
+    }
+    world->scratch_hidden = malloc((size_t)config->hidden_size *
+                                   sizeof(*world->scratch_hidden));
+    world->scratch_genome = malloc(world->layout.genome_count *
+                                   sizeof(*world->scratch_genome));
+    if (world->scratch_hidden == NULL || world->scratch_genome == NULL) {
+        free(world->scratch_hidden);
+        free(world->scratch_genome);
+        world->scratch_hidden = NULL;
+        world->scratch_genome = NULL;
+        alife_set_error(error, error_size, "Could not allocate neural scratch space.");
+        return false;
+    }
+    alife_rng_seed(&world->rng, config->seed);
+    world->next_id = 1U;
+    world->year = (int32_t)config->calendar_start_year;
+    world->month = (int32_t)config->calendar_start_month;
+    world->day = (int32_t)config->calendar_start_day;
+    world->last_april_year = INT32_MIN;
+    if (!open_event_log(world, log_mode, error, error_size)) {
+        free(world->scratch_hidden);
+        free(world->scratch_genome);
+        world->scratch_hidden = NULL;
+        world->scratch_genome = NULL;
+        return false;
+    }
+    world->initialized = true;
+    if (add_seeds && !seed_population(world, error, error_size)) {
+        alife_world_destroy(world);
+        return false;
+    }
+    return true;
+}
+
+bool alife_world_init(AlifeWorld *world, const AlifeConfig *config,
+                      char *error, size_t error_size) {
+    if (!alife_setup_world(world, config, "w", false, error, error_size)) {
+        return false;
+    }
+    alife_log_run_start(world);
+    if (!seed_population(world, error, error_size)) {
+        alife_world_destroy(world);
+        return false;
+    }
+    return true;
+}
+
+static void remove_at(AlifeWorld *world, size_t index, AlifeDeathCause cause) {
+    size_t last = world->count - 1U;
+
+    alife_log_death(world, &world->organisms[index], cause);
+    ++world->total_deaths;
+    if (index != last) {
+        world->organisms[index] = world->organisms[last];
+        memcpy(alife_slot(world, index), alife_slot(world, last),
+               world->layout.slot_floats * sizeof(float));
+    }
+    --world->count;
+    world->population_bytes =
+        (uint64_t)world->count * (uint64_t)alife_organism_size(world);
+}
+
+void alife_world_destroy(AlifeWorld *world) {
+    size_t i;
+
+    if (world == NULL) {
+        return;
+    }
+    if (world->initialized) {
+        for (i = 0U; i < world->count; ++i) {
+            alife_log_death(world, &world->organisms[i], ALIFE_DEATH_SHUTDOWN);
+            ++world->total_deaths;
+        }
+        world->count = 0U;
+        world->population_bytes = 0U;
+        alife_log_run_end(world);
+    }
+    if (world->event_log != NULL) {
+        (void)fclose(world->event_log);
+    }
+    free(world->organisms);
+    free(world->data);
+    free(world->scratch_ids);
+    free(world->scratch_hidden);
+    free(world->scratch_genome);
+    memset(world, 0, sizeof(*world));
+}
+
+static size_t find_index(const AlifeWorld *world, uint64_t id) {
+    size_t i;
+
+    for (i = 0U; i < world->count; ++i) {
+        if (world->organisms[i].id == id) {
+            return i;
+        }
+    }
+    return SIZE_MAX;
+}
+
+const AlifeOrganism *alife_find_organism(const AlifeWorld *world, uint64_t id) {
+    size_t index;
+
+    if (world == NULL) {
+        return NULL;
+    }
+    index = find_index(world, id);
+    return index == SIZE_MAX ? NULL : &world->organisms[index];
+}
+
+AlifeOrganism *alife_find_organism_mut(AlifeWorld *world, uint64_t id) {
+    size_t index;
+
+    if (world == NULL) {
+        return NULL;
+    }
+    index = find_index(world, id);
+    return index == SIZE_MAX ? NULL : &world->organisms[index];
+}
+
+float *alife_organism_genome_mut(AlifeWorld *world, uint64_t id) {
+    size_t index;
+
+    if (world == NULL) {
+        return NULL;
+    }
+    index = find_index(world, id);
+    return index == SIZE_MAX ? NULL : alife_slot(world, index);
+}
+
+const float *alife_organism_genome(const AlifeWorld *world, uint64_t id) {
+    size_t index;
+
+    if (world == NULL) {
+        return NULL;
+    }
+    index = find_index(world, id);
+    return index == SIZE_MAX ? NULL : alife_slot_const(world, index);
+}
+
+bool alife_genome_validate(const AlifeWorld *world, const float *genome,
+                           char *error, size_t error_size) {
+    size_t i;
+
+    if (world == NULL || genome == NULL) {
+        alife_set_error(error, error_size, "The genome must not be null.");
+        return false;
+    }
+    for (i = 0U; i < world->layout.genome_count; ++i) {
+        if (!isfinite((double)genome[i]) ||
+            fabs((double)genome[i]) > world->config.max_abs_weight) {
+            alife_set_error(error, error_size,
+                            "Genome parameter %zu is not finite or exceeds its bound.", i);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool alife_organism_state_valid(const AlifeWorld *world, size_t index) {
+    const float *slot = alife_slot_const(world, index);
+    const AlifeOrganism *organism = &world->organisms[index];
+    size_t i;
+
+    if (organism->id == 0U ||
+        !isfinite((double)organism->reproduction_output) ||
+        !isfinite((double)organism->acceptance_output) ||
+        fabs((double)organism->reproduction_output) > 1.0001 ||
+        fabs((double)organism->acceptance_output) > 1.0001) {
+        return false;
+    }
+    if (!alife_genome_validate(world, slot, NULL, 0U)) {
+        return false;
+    }
+    for (i = world->layout.plastic_state; i < world->layout.hidden_state; ++i) {
+        size_t edge = i - world->layout.plastic_state;
+        double effective =
+            (double)slot[world->layout.recurrent_weights + edge] +
+            (double)slot[i];
+        if (!isfinite((double)slot[i]) ||
+            fabs((double)slot[i]) > world->config.plasticity_limit + 1.0e-6 ||
+            !isfinite(effective) ||
+            fabs(effective) > world->config.max_abs_weight + 1.0e-6) {
+            return false;
+        }
+    }
+    for (i = world->layout.hidden_state; i < world->layout.slot_floats; ++i) {
+        if (!isfinite((double)slot[i]) || fabs((double)slot[i]) > 1.0001) {
+            return false;
+        }
+    }
+    return true;
+}
+
+double alife_reproduction_probability(const AlifeWorld *world,
+                                      const AlifeOrganism *organism) {
+    double progress;
+
+    if (world == NULL || organism == NULL ||
+        organism->age < world->config.maturity_age) {
+        return 0.0;
+    }
+    if (world->config.reproduction_ramp_ticks == 0U) {
+        return world->config.reproduction_max_probability;
+    }
+    progress = (double)(organism->age - world->config.maturity_age) /
+               (double)world->config.reproduction_ramp_ticks;
+    progress = clamp_double(progress, 0.0, 1.0);
+    return world->config.reproduction_base_probability +
+           progress * (world->config.reproduction_max_probability -
+                       world->config.reproduction_base_probability);
+}
+
+bool alife_reproduction_eligible(const AlifeWorld *world,
+                                 const AlifeOrganism *organism) {
+    return world != NULL && organism != NULL && !world->stopped &&
+           !(world->month == 4 && world->day == 1) &&
+           organism->age >= world->config.maturity_age &&
+           organism->reproduction_output > 0.0F &&
+           organism->acceptance_output > 0.0F;
+}
+
+static void record_attempt(AlifeWorld *world, AlifeOrganism *first,
+                           AlifeOrganism *second) {
+    ++world->total_reproduction_attempts;
+    if (first != NULL) {
+        ++first->reproduction_attempts;
+    }
+    if (second != NULL && second != first) {
+        ++second->reproduction_attempts;
+    }
+}
+
+bool alife_try_birth(AlifeWorld *world, uint64_t parent_a_id,
+                     uint64_t parent_b_id, bool opportunity_granted,
+                     char *error, size_t error_size) {
+    size_t first_index;
+    size_t second_index;
+    AlifeOrganism *first;
+    AlifeOrganism *second;
+    float *child;
+    const float *first_genome;
+    const float *second_genome;
+    size_t i;
+    uint64_t mutations = 0U;
+    uint64_t generation;
+    bool result;
+
+    if (world == NULL || !world->initialized) {
+        alife_set_error(error, error_size, "The world is not initialized.");
+        return false;
+    }
+    first_index = find_index(world, parent_a_id);
+    second_index = find_index(world, parent_b_id);
+    first = first_index == SIZE_MAX ? NULL : &world->organisms[first_index];
+    second = second_index == SIZE_MAX ? NULL : &world->organisms[second_index];
+    record_attempt(world, first, second);
+    if (parent_a_id == parent_b_id) {
+        alife_log_reproduction(world, parent_a_id, parent_b_id, false,
+                               "parents_not_distinct");
+        alife_set_error(error, error_size, "Reproduction requires two distinct organisms.");
+        return false;
+    }
+    if (first == NULL || second == NULL) {
+        alife_log_reproduction(world, parent_a_id, parent_b_id, false,
+                               "parent_not_living");
+        alife_set_error(error, error_size, "Both parents must be living organisms.");
+        return false;
+    }
+    if (!opportunity_granted) {
+        alife_log_reproduction(world, parent_a_id, parent_b_id, false,
+                               "opportunity_not_granted");
+        alife_set_error(error, error_size, "The substrate did not grant an opportunity.");
+        return false;
+    }
+    if (!alife_reproduction_eligible(world, first) ||
+        !alife_reproduction_eligible(world, second)) {
+        alife_log_reproduction(world, parent_a_id, parent_b_id, false,
+                               "parent_not_eligible");
+        alife_set_error(error, error_size, "Both parents must be mature and consenting.");
+        return false;
+    }
+    if ((uint64_t)alife_organism_size(world) > world->config.capacity_bytes) {
+        alife_log_reproduction(world, parent_a_id, parent_b_id, false,
+                               "insufficient_capacity");
+        alife_set_error(error, error_size, "Capacity cannot hold an offspring.");
+        return false;
+    }
+    child = world->scratch_genome;
+    first_genome = alife_slot_const(world, first_index);
+    second_genome = alife_slot_const(world, second_index);
+    for (i = 0U; i < world->layout.genome_count; ++i) {
+        double value;
+        uint64_t choice = alife_rng_bounded(&world->rng, 20U);
+        if (choice < 2U) {
+            value = 0.5 * ((double)first_genome[i] + (double)second_genome[i]);
+        } else if ((choice & 1U) == 0U) {
+            value = (double)first_genome[i];
+        } else {
+            value = (double)second_genome[i];
+        }
+        if (alife_rng_unit(&world->rng) < world->config.mutation_probability) {
+            value += alife_rng_symmetric(&world->rng) *
+                     world->config.mutation_magnitude;
+            ++mutations;
+        }
+        child[i] = (float)clamp_double(value,
+                                       -world->config.max_abs_weight,
+                                       world->config.max_abs_weight);
+    }
+    if (!alife_genome_validate(world, child, error, error_size)) {
+        alife_log_reproduction(world, parent_a_id, parent_b_id, false,
+                               "invalid_offspring");
+        return false;
+    }
+    generation = first->generation > second->generation ?
+                 first->generation + 1U : second->generation + 1U;
+    if (!alife_reserve(world, world->count + 1U, error, error_size)) {
+        alife_log_reproduction(world, parent_a_id, parent_b_id, false,
+                               "allocation_failed");
+        return false;
+    }
+    alife_log_reproduction(world, parent_a_id, parent_b_id, true, "approved");
+    result = append_organism(world, child, parent_a_id, parent_b_id,
+                             generation, mutations, error, error_size);
+    if (!result) {
+        alife_log_reproduction(world, parent_a_id, parent_b_id, false,
+                               "allocation_failed");
+        return false;
+    }
+    first = alife_find_organism_mut(world, parent_a_id);
+    second = alife_find_organism_mut(world, parent_b_id);
+    if (first != NULL) {
+        ++first->successful_reproductions;
+    }
+    if (second != NULL) {
+        ++second->successful_reproductions;
+    }
+    alife_enforce_capacity(world);
+    return true;
+}
+
+void alife_enforce_capacity(AlifeWorld *world) {
+    while (world != NULL && world->count > 0U &&
+           world->population_bytes > world->config.capacity_bytes) {
+        size_t oldest = 0U;
+        size_t i;
+        for (i = 1U; i < world->count; ++i) {
+            if (world->organisms[i].age > world->organisms[oldest].age ||
+                (world->organisms[i].age == world->organisms[oldest].age &&
+                 world->organisms[i].id < world->organisms[oldest].id)) {
+                oldest = i;
+            }
+        }
+        remove_at(world, oldest, ALIFE_DEATH_CAPACITY);
+    }
+}
+
+static void build_inputs(const AlifeWorld *world, size_t index, float *inputs) {
+    const AlifeOrganism *organism = &world->organisms[index];
+    const float *slot = alife_slot_const(world, index);
+    size_t input_size = (size_t)world->config.input_size;
+    size_t communication = (size_t)world->config.communication_size;
+    size_t i;
+    double scale = (double)(world->config.maturity_age +
+                            world->config.reproduction_ramp_ticks + 1U);
+    double day_fraction = ((double)(world->month - 1) * 31.0 +
+                           (double)(world->day - 1)) / 372.0;
+
+    for (i = 0U; i < input_size + communication; ++i) {
+        inputs[i] = 0.0F;
+    }
+    inputs[0] = (float)clamp_double((double)organism->age / scale, 0.0, 1.0);
+    inputs[1] = (float)clamp_double((double)organism->reward / scale, 0.0, 1.0);
+    inputs[2] = organism->age >= world->config.maturity_age ? 1.0F : 0.0F;
+    inputs[3] = (float)alife_reproduction_probability(world, organism);
+    inputs[4] = world->config.capacity_bytes == 0U ? 0.0F :
+        (float)((double)world->population_bytes /
+                (double)world->config.capacity_bytes);
+    inputs[5] = (float)day_fraction;
+    if (input_size > 6U) {
+        inputs[6] = (float)((double)world->month / 12.0);
+    }
+    if (input_size > 7U) {
+        inputs[7] = (float)((double)world->day / 31.0);
+    }
+    for (i = 0U; i < communication; ++i) {
+        inputs[input_size + i] = slot[world->layout.inbox + i];
+    }
+}
+
+static void execute_organism(AlifeWorld *world, size_t index) {
+    size_t hidden = (size_t)world->config.hidden_size;
+    size_t input_count = (size_t)world->config.input_size +
+                         (size_t)world->config.communication_size;
+    size_t communication = (size_t)world->config.communication_size;
+    float inputs[ALIFE_MAX_INPUTS];
+    float *slot = alife_slot(world, index);
+    float *state = slot + world->layout.hidden_state;
+    float *delta = slot + world->layout.plastic_state;
+    size_t i;
+    size_t j;
+    double plastic_magnitude = 0.0;
+
+    build_inputs(world, index, inputs);
+    for (i = 0U; i < hidden; ++i) {
+        double activation = (double)slot[world->layout.hidden_biases + i];
+        for (j = 0U; j < input_count; ++j) {
+            activation += (double)slot[world->layout.input_weights +
+                                      i * input_count + j] * (double)inputs[j];
+        }
+        for (j = 0U; j < hidden; ++j) {
+            size_t edge = i * hidden + j;
+            activation += ((double)slot[world->layout.recurrent_weights + edge] +
+                           (double)delta[edge]) * (double)state[j];
+        }
+        world->scratch_hidden[i] = (float)tanh(activation);
+    }
+    for (i = 0U; i < world->layout.output_count; ++i) {
+        double activation = (double)slot[world->layout.output_biases + i];
+        for (j = 0U; j < hidden; ++j) {
+            activation += (double)slot[world->layout.output_weights +
+                                      i * hidden + j] *
+                          (double)world->scratch_hidden[j];
+        }
+        if (i < communication) {
+            slot[world->layout.outbox + i] = (float)tanh(activation);
+        } else if (i == communication) {
+            world->organisms[index].reproduction_output = (float)tanh(activation);
+        } else {
+            world->organisms[index].acceptance_output = (float)tanh(activation);
+        }
+    }
+    for (i = 0U; i < hidden; ++i) {
+        double rate = ALIFE_PLASTIC_RATE_SCALE *
+                      tanh((double)slot[world->layout.plastic_rates + i]);
+        double decay = clamp_double(
+            world->config.plasticity_decay +
+            0.01 * tanh((double)slot[world->layout.plastic_decays + i]),
+            0.0, 1.0);
+        for (j = 0U; j < hidden; ++j) {
+            size_t edge = i * hidden + j;
+            double old_value = (double)delta[edge];
+            double value = decay * old_value + rate * (double)state[j] *
+                           (double)world->scratch_hidden[i];
+            double base = (double)slot[world->layout.recurrent_weights + edge];
+            value = clamp_double(value, -world->config.plasticity_limit,
+                                 world->config.plasticity_limit);
+            value = clamp_double(value,
+                                 -world->config.max_abs_weight - base,
+                                 world->config.max_abs_weight - base);
+            delta[edge] = (float)value;
+            plastic_magnitude += fabs(value - old_value);
+        }
+    }
+    memcpy(state, world->scratch_hidden, hidden * sizeof(*state));
+    ++world->organisms[index].executions;
+    ++world->total_executions;
+    if (plastic_magnitude >= ALIFE_SIGNIFICANT_PLASTICITY) {
+        uint64_t *changes =
+            &world->organisms[index].significant_weight_changes;
+        if (*changes < UINT64_MAX) {
+            ++(*changes);
+        }
+        if (*changes != 0U && ((*changes & (*changes - 1U)) == 0U)) {
+            alife_log_plasticity(world, &world->organisms[index],
+                                 plastic_magnitude);
+        }
+    }
+}
+
+static void deliver_communication(AlifeWorld *world) {
+    double sums[ALIFE_MAX_COMMUNICATION] = {0.0};
+    size_t communication = (size_t)world->config.communication_size;
+    size_t i;
+    size_t j;
+
+    for (i = 0U; i < world->count; ++i) {
+        const float *slot = alife_slot_const(world, i);
+        for (j = 0U; j < communication; ++j) {
+            sums[j] += (double)slot[world->layout.outbox + j];
+        }
+    }
+    for (i = 0U; i < world->count; ++i) {
+        float *slot = alife_slot(world, i);
+        for (j = 0U; j < communication; ++j) {
+            if (world->count <= 1U) {
+                slot[world->layout.inbox + j] = 0.0F;
+            } else {
+                slot[world->layout.inbox + j] = (float)(
+                    (sums[j] - (double)slot[world->layout.outbox + j]) /
+                    (double)(world->count - 1U));
+            }
+        }
+    }
+}
+
+static void process_reproduction(AlifeWorld *world) {
+    size_t candidates = 0U;
+    size_t i;
+    char ignored[128];
+
+    for (i = 0U; i < world->count; ++i) {
+        AlifeOrganism *organism = &world->organisms[i];
+        if (alife_reproduction_eligible(world, organism) &&
+            alife_rng_unit(&world->rng) <
+                alife_reproduction_probability(world, organism)) {
+            world->scratch_ids[candidates++] = organism->id;
+        }
+    }
+    for (i = candidates; i > 1U; --i) {
+        size_t other = (size_t)alife_rng_bounded(&world->rng, (uint64_t)i);
+        uint64_t temporary = world->scratch_ids[i - 1U];
+        world->scratch_ids[i - 1U] = world->scratch_ids[other];
+        world->scratch_ids[other] = temporary;
+    }
+    for (i = 0U; i + 1U < candidates; i += 2U) {
+        (void)alife_try_birth(world, world->scratch_ids[i],
+                              world->scratch_ids[i + 1U], true,
+                              ignored, sizeof(ignored));
+    }
+}
+
+static void kill_all(AlifeWorld *world, AlifeDeathCause cause) {
+    while (world->count > 0U) {
+        remove_at(world, world->count - 1U, cause);
+    }
+}
+
+static bool periodic_work(AlifeWorld *world, char *error, size_t error_size) {
+    if (world->config.summary_interval > 0U &&
+        world->tick % world->config.summary_interval == 0U) {
+        alife_log_summary(world);
+    }
+    if (world->config.checkpoint_interval > 0U &&
+        world->tick % world->config.checkpoint_interval == 0U &&
+        world->config.checkpoint_path[0] != '\0') {
+        if (!alife_world_save(world, world->config.checkpoint_path,
+                              error, error_size)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool alife_world_step(AlifeWorld *world, char *error, size_t error_size) {
+    size_t i;
+    uint64_t first_new_id;
+
+    if (world == NULL || !world->initialized) {
+        alife_set_error(error, error_size, "The world is not initialized.");
+        return false;
+    }
+    if (world->stopped) {
+        return true;
+    }
+    if (world->tick == UINT64_MAX) {
+        alife_set_error(error, error_size, "The simulation tick counter is exhausted.");
+        return false;
+    }
+    if (world->month == 4 && world->day == 1 &&
+        (world->last_april_year != world->year || world->count > 0U)) {
+        kill_all(world, ALIFE_DEATH_APRIL_1);
+        world->last_april_year = world->year;
+        if (world->config.april_1_behavior == ALIFE_APRIL_TERMINATE) {
+            world->stopped = true;
+        } else {
+            world->pending_reseed = true;
+        }
+        ++world->tick;
+        return periodic_work(world, error, error_size);
+    }
+    if ((world->tick + 1U) % world->config.ticks_per_day == 0U) {
+        if (world->year == 9999 && world->month == 12 && world->day == 31) {
+            alife_set_error(error, error_size,
+                            "The simulated calendar exceeded year 9999.");
+            return false;
+        }
+        advance_date(world);
+    }
+    if (world->month == 4 && world->day == 1) {
+        if (world->last_april_year != world->year || world->count > 0U) {
+            kill_all(world, ALIFE_DEATH_APRIL_1);
+            world->last_april_year = world->year;
+            if (world->config.april_1_behavior == ALIFE_APRIL_TERMINATE) {
+                world->stopped = true;
+            } else {
+                world->pending_reseed = true;
+            }
+        }
+        ++world->tick;
+        return periodic_work(world, error, error_size);
+    }
+    if (world->pending_reseed && world->month == 4 && world->day >= 2) {
+        if (!seed_population(world, error, error_size)) {
+            return false;
+        }
+        world->pending_reseed = false;
+        alife_log_reseed(world);
+    }
+
+    i = 0U;
+    while (i < world->count) {
+        if (!alife_organism_state_valid(world, i)) {
+            remove_at(world, i, ALIFE_DEATH_INVALID_STATE);
+        } else {
+            execute_organism(world, i);
+            if (!alife_organism_state_valid(world, i)) {
+                remove_at(world, i, ALIFE_DEATH_INVALID_STATE);
+            } else {
+                ++i;
+            }
+        }
+    }
+    deliver_communication(world);
+    first_new_id = world->next_id;
+    process_reproduction(world);
+    alife_enforce_capacity(world);
+    for (i = 0U; i < world->count; ++i) {
+        if (world->organisms[i].id < first_new_id) {
+            AlifeRewardContext reward_context;
+            reward_context.tick = world->tick;
+            reward_context.age = world->organisms[i].age;
+            reward_context.accumulated_reward = world->organisms[i].reward;
+            reward_context.survived_tick = true;
+            world->organisms[i].reward +=
+                alife_reward_calculate(&reward_context);
+            ++world->organisms[i].age;
+        }
+    }
+    ++world->tick;
+    return periodic_work(world, error, error_size);
+}
+
+bool alife_world_run(AlifeWorld *world, char *error, size_t error_size) {
+    while (world->tick < world->config.tick_count && !world->stopped) {
+        if (!alife_world_step(world, error, error_size)) {
+            return false;
+        }
+    }
+    if (world->config.summary_interval > 0U &&
+        world->tick % world->config.summary_interval != 0U) {
+        alife_log_summary(world);
+    }
+    return true;
+}
