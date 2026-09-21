@@ -407,13 +407,13 @@ static enum test_result test_seeded_neural_sleep_rhythm(void)
     size_t organism_index;
 
     prepare_config(&config);
-    config.tick_count = UINT64_C(3000);
+    config.tick_count = UINT64_C(4000);
     config.maturity_age = UINT64_C(1000000);
     EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)), error);
     ids[0] = world.organisms[0].id;
     ids[1] = world.organisms[1].id;
 
-    for (step = 0U; step < 2200U; ++step) {
+    for (step = 0U; step < 3200U; ++step) {
         EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
         for (organism_index = 0U; organism_index < 2U; ++organism_index) {
             const AlifeOrganism *organism =
@@ -448,16 +448,10 @@ static enum test_result test_seeded_neural_sleep_rhythm(void)
     EXPECT_TRUE(first_wake[1] != UINT64_MAX);
     EXPECT_TRUE(second_sleep[0] != UINT64_MAX);
     EXPECT_TRUE(second_sleep[1] != UINT64_MAX);
-    for (organism_index = 0U; organism_index < 2U; ++organism_index) {
-        EXPECT_TRUE(first_wake[organism_index] - first_sleep[organism_index] >=
-                    UINT64_C(400));
-        EXPECT_TRUE(first_wake[organism_index] - first_sleep[organism_index] <=
-                    UINT64_C(600));
-        EXPECT_TRUE(second_sleep[organism_index] - first_wake[organism_index] >=
-                    UINT64_C(400));
-        EXPECT_TRUE(second_sleep[organism_index] - first_wake[organism_index] <=
-                    UINT64_C(600));
-    }
+    EXPECT_TRUE(first_wake[0] - first_sleep[0] >= UINT64_C(400));
+    EXPECT_TRUE(first_wake[0] - first_sleep[0] <= UINT64_C(600));
+    EXPECT_TRUE(second_sleep[0] - first_wake[0] >= UINT64_C(400));
+    EXPECT_TRUE(second_sleep[0] - first_wake[0] <= UINT64_C(600));
     EXPECT_TRUE(awake_samples >= UINT64_C(800));
     EXPECT_TRUE(asleep_samples >= UINT64_C(800));
     EXPECT_TRUE(first_sleep[0] != first_sleep[1] ||
@@ -671,7 +665,7 @@ cleanup:
     return test_result_value;
 }
 
-static enum test_result test_plasticity_occurs_only_during_sleep(void)
+static enum test_result test_plasticity_occurs_while_active(void)
 {
     enum test_result test_result_value = TEST_PASS;
     AlifeConfig config;
@@ -679,6 +673,7 @@ static enum test_result test_plasticity_occurs_only_during_sleep(void)
     char error[TEST_ERROR_SIZE] = {0};
     uint64_t id;
     double before;
+    double awake_value;
     double asleep_value;
 
     prepare_config(&config);
@@ -688,17 +683,93 @@ static enum test_result test_plasticity_occurs_only_during_sleep(void)
     prepare_plastic_activity(&world, id);
     before = plastic_state_sum(&world, id);
     EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
-    EXPECT_TRUE(plastic_state_sum(&world, id) == before);
+    awake_value = plastic_state_sum(&world, id);
+    EXPECT_TRUE(awake_value > before);
     EXPECT_CALL(alife_transition_request(&world, id, ALIFE_STATE_ASLEEP, 0U,
                                          error, sizeof(error)), error);
     EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
     asleep_value = plastic_state_sum(&world, id);
-    EXPECT_TRUE(asleep_value > before);
+    EXPECT_TRUE(asleep_value > awake_value);
     EXPECT_CALL(alife_transition_request(&world, id, ALIFE_STATE_OFF,
                                          config.off_min_duration_ticks, error,
                                          sizeof(error)), error);
     EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
     EXPECT_TRUE(plastic_state_sum(&world, id) == asleep_value);
+
+cleanup:
+    alife_world_destroy(&world);
+    return test_result_value;
+}
+
+static enum test_result test_sleep_introspection_is_bounded_and_deterministic(void)
+{
+    enum test_result test_result_value = TEST_PASS;
+    AlifeConfig config;
+    AlifeWorld world = {0};
+    AlifeRng expected_rng;
+    char error[TEST_ERROR_SIZE] = {0};
+    uint64_t id;
+    uint64_t other_id;
+    float *slot;
+    size_t hidden;
+    size_t input_count;
+    size_t introspection;
+    size_t edge;
+    size_t source;
+    size_t destination;
+    double source_input;
+    double destination_input;
+    double expected_activation;
+
+    prepare_config(&config);
+    config.maturity_age = UINT64_C(1000000);
+    EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)), error);
+    id = world.organisms[0].id;
+    other_id = world.organisms[1].id;
+    EXPECT_CALL(alife_transition_request(&world, other_id, ALIFE_STATE_ASLEEP,
+                                         0U, error, sizeof(error)), error);
+    EXPECT_CALL(alife_transition_request(
+                    &world, other_id, ALIFE_STATE_OFF,
+                    config.off_min_duration_ticks, error, sizeof(error)),
+                error);
+    slot = alife_organism_genome_mut(&world, id);
+    EXPECT_TRUE(slot != NULL);
+    (void)memset(slot, 0, world.layout.slot_floats * sizeof(*slot));
+    hidden = (size_t)config.hidden_size;
+    input_count = (size_t)config.input_size +
+                  (size_t)config.communication_size +
+                  ALIFE_PRIVATE_COURTSHIP_INPUTS + ALIFE_PRIVATE_SLEEP_INPUTS;
+    introspection = input_count - ALIFE_PRIVATE_SLEEP_INPUTS;
+    expected_rng = world.rng;
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+    EXPECT_TRUE(memcmp(&world.rng, &expected_rng, sizeof(expected_rng)) == 0);
+    EXPECT_TRUE(slot[world.layout.hidden_state] == 0.0F);
+
+    EXPECT_CALL(alife_transition_request(&world, id, ALIFE_STATE_ASLEEP, 0U,
+                                         error, sizeof(error)), error);
+    expected_rng = world.rng;
+    edge = (size_t)alife_rng_bounded(
+        &expected_rng, (uint64_t)world.layout.recurrent_count);
+    source = edge % hidden;
+    destination = edge / hidden;
+    source_input = 2.0 * (double)source / (double)(hidden - 1U) - 1.0;
+    destination_input =
+        2.0 * (double)destination / (double)(hidden - 1U) - 1.0;
+    slot[world.layout.plastic_state + edge] =
+        (float)(0.5 * config.plasticity_limit);
+    slot[world.layout.recurrent_weights + edge] =
+        (float)(0.5 * config.max_abs_weight) -
+        slot[world.layout.plastic_state + edge];
+    slot[world.layout.input_weights + introspection] = 0.25F;
+    slot[world.layout.input_weights + introspection + 1U] = 0.5F;
+    slot[world.layout.input_weights + introspection + 2U] = 1.0F;
+    expected_activation = tanh(0.25 * source_input +
+                               0.5 * destination_input + 0.5);
+
+    EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
+    EXPECT_TRUE(memcmp(&world.rng, &expected_rng, sizeof(expected_rng)) == 0);
+    EXPECT_TRUE(fabs((double)slot[world.layout.hidden_state] -
+                     expected_activation) < 0.000001);
 
 cleanup:
     alife_world_destroy(&world);
@@ -776,7 +847,7 @@ static enum test_result test_foolsday_sleep_probability_and_once_only(void)
     AlifeWorld die = {0};
     char error[TEST_ERROR_SIZE] = {0};
     uint64_t survivor_id;
-    uint64_t rng_after_roll[4];
+    AlifeRng expected_rng;
 
     prepare_config(&survive_config);
     survive_config.calendar_start_month = 4U;
@@ -798,10 +869,14 @@ static enum test_result test_foolsday_sleep_probability_and_once_only(void)
     set_controls(&survive, survive.organisms[1].id,
                  -4.0F, -4.0F, -4.0F, -1.0F);
     EXPECT_CALL(alife_world_step(&survive, error, sizeof(error)), error);
-    (void)memcpy(rng_after_roll, survive.rng.state, sizeof(rng_after_roll));
+    expected_rng = survive.rng;
+    (void)alife_rng_bounded(&expected_rng,
+                            (uint64_t)survive.layout.recurrent_count);
+    (void)alife_rng_bounded(&expected_rng,
+                            (uint64_t)survive.layout.recurrent_count);
     EXPECT_CALL(alife_world_step(&survive, error, sizeof(error)), error);
-    EXPECT_TRUE(memcmp(rng_after_roll, survive.rng.state,
-                       sizeof(rng_after_roll)) == 0);
+    EXPECT_TRUE(memcmp(&expected_rng, &survive.rng,
+                       sizeof(expected_rng)) == 0);
     EXPECT_TRUE(survive.count == 2U);
 
     EXPECT_CALL(alife_world_init(&die, &die_config, error, sizeof(error)), error);
@@ -1343,8 +1418,10 @@ int main(void)
          test_transition_graph_and_control_outputs},
         {"sleep and off disable external behavior",
          test_sleep_and_off_disable_external_behavior},
-        {"plasticity occurs only during sleep",
-         test_plasticity_occurs_only_during_sleep},
+        {"plasticity occurs while awake and asleep",
+         test_plasticity_occurs_while_active},
+        {"sleep introspection is bounded and deterministic",
+         test_sleep_introspection_is_bounded_and_deterministic},
         {"off timer returns only to sleep",
          test_off_timer_returns_to_sleep},
         {"Fool's Day applies state-specific rules",

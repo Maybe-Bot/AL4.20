@@ -38,7 +38,8 @@ Every living organism contains:
 
 The network has a fixed topology for one run. Let `I` be `input_size`, `H` be
 `hidden_size`, and `C` be `communication_size`. The input vector has `I`
-substrate values and `C` delivered message values. Substrate values include
+substrate values, `C` delivered message values, one private courtship value,
+and three private sleep-introspection values. Substrate values include
 normalized age and reward, simulated calendar signals, and bounded self and
 population signals. Hidden and output activations use `tanh`.
 
@@ -46,18 +47,18 @@ The genome stores these arrays:
 
 | Array | Gene count |
 | --- | ---: |
-| Input-to-hidden weights | `H * (I + C)` |
+| Input-to-hidden weights | `H * (I + C + 4)` |
 | Base recurrent weights | `H * H` |
 | Hidden biases | `H` |
-| Hidden-to-output weights | `(C + 6) * H` |
-| Output biases | `C + 6` |
+| Hidden-to-output weights | `(C + 7) * H` |
+| Output biases | `C + 7` |
 | Plasticity rates | `H` |
 | Plasticity decays | `H` |
 
-The total heritable parameter count is therefore
-`H*(I+C) + H*H + H + (C+6)*H + (C+6) + 2*H`. Configuration validation requires
-500 through 2,000 parameters. The default dimensions, `I=8`, `H=24`, and `C=2`,
-produce 1,088 heritable parameters.
+The total heritable parameter count is therefore `H*(I+C+4) + H*H + H +
+(C+7)*H + (C+7) + 2*H`. Configuration validation requires 500 through 2,000
+parameters. The default dimensions, `I=8`, `H=24`, and `C=2`, produce 1,209
+heritable parameters.
 
 The first substrate inputs have fixed meanings:
 
@@ -73,7 +74,8 @@ The first substrate inputs have fixed meanings:
 | 7 | Simulated day divided by 31, when `I` is at least 8. |
 
 Additional substrate inputs are reserved and start at zero. The `C` inbox
-values follow the `I` substrate values.
+values and private courtship value follow the `I` substrate values. The final
+three channels are reserved for sleep introspection and are zero while awake.
 
 Runtime state adds `H` hidden activations, `C` inbox values, `C` outbox values,
 and `H * H` lifetime recurrent deltas. Network evaluation uses the base
@@ -131,12 +133,13 @@ AWAKE -> ASLEEP -> OFF
 ```
 
 - `AWAKE` supplies external, self, calendar, population, and communication
-  inputs. The organism can communicate and reproduce but cannot apply lifetime
-  plasticity. Its only lifecycle request is sleep.
-- `ASLEEP` supplies no fresh inputs. Recurrent activity continues from stored
-  hidden state, and this is the only state that applies lifetime plasticity.
-  Ordinary messages and reproduction outputs are cleared. Private controls can
-  request wake or off.
+  inputs. The organism can communicate and reproduce, and ordinary lifetime
+  plasticity remains active. Its only lifecycle request is sleep.
+- `ASLEEP` supplies no external or world inputs. Recurrent activity and
+  ordinary lifetime plasticity continue from stored hidden state. Each tick,
+  three private inputs describe one sampled recurrent connection. Ordinary
+  messages and reproduction outputs are cleared. Private controls can request
+  wake or off.
 - `OFF` performs no neural computation, communication, reproduction, or
   plasticity. It preserves organism and neural state while the substrate checks
   only its absolute `back_on_tick` and minimal metadata.
@@ -152,9 +155,9 @@ accumulate sleep pressure or enforce a biological clock.
 
 ## Lifetime plasticity
 
-Organisms do not use backpropagation. After an asleep execution step, the
-substrate applies a local Hebbian update to recurrent lifetime deltas. For
-connection `j -> i`, the update is conceptually:
+Organisms do not use backpropagation. After every awake or asleep execution
+step, the substrate applies a local Hebbian update to recurrent lifetime
+deltas. For connection `j -> i`, the update is conceptually:
 
 ```text
 rate[i] = 0.05 * tanh(rate_gene[i])
@@ -168,8 +171,23 @@ the decay baseline, lifetime-delta limit, and absolute weight limit.
 The substrate rejects non-finite state and clamps permitted changes. Lifetime
 deltas affect only the organism that learned them. The genome retains the base
 weights, plasticity rates, and plasticity decays used to construct descendants.
-Awake execution reads the existing deltas but does not update or decay them.
-Off execution does not touch the network.
+Off execution does not touch the network or lifetime deltas.
+
+## Sleep introspection
+
+On each sleep execution, the substrate selects one of the `H * H` recurrent
+connections with the simulation PRNG. It supplies the source index, destination
+index, and current effective weight (base gene plus lifetime delta) through the
+three private sleep channels. Indices are mapped linearly from `0..H-1` into
+`[-1, 1]`; the weight is divided by `max_abs_weight` and clamped to the same
+range. These channels are zero while awake, and OFF performs no selection or
+network execution.
+
+The sample is read-only and exposes neither a genome address nor arbitrary
+memory. Its input weights, downstream interpretation, recurrent response, and
+Hebbian consequences are all ordinary evolvable network behavior. PRNG state
+is already checkpointed, so selection and resumed execution remain exactly
+reproducible.
 
 ## Reward interface
 
@@ -295,11 +313,12 @@ The following order defines a tick:
 1. **Time:** Advance the simulated calendar at the configured tick boundary.
 2. **Timers:** Return each expired off organism to sleep.
 3. **Calendar policy:** Apply state-dependent Fool's Day rules.
-4. **Execution:** Give awake networks fresh inputs, run sleeping networks from
-   recurrent state only, and skip off networks.
-5. **Plasticity and transitions:** Apply plasticity only during sleep, then
-   validate private state requests. A timer-expired organism completes this
-   sleep phase before it can wake.
+4. **Execution:** Give awake networks fresh inputs, give sleeping networks one
+   read-only recurrent-weight sample but no external/world inputs, and skip off
+   networks.
+5. **Plasticity and transitions:** Apply plasticity after awake and sleep
+   execution, then validate private state requests. A timer-expired organism
+   completes this sleep phase before it can wake.
 6. **Communication:** Aggregate only awake senders and deliver only to awake
    recipients.
 7. **Pairing:** Evaluate awake request, acceptance, maturity, and opportunity.

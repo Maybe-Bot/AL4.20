@@ -41,11 +41,12 @@ AWAKE -> ASLEEP -> OFF
 ```
 
 Awake is the interaction state: environmental and calendar inputs,
-communication, and reproduction are available, but neural plasticity is not.
+communication, reproduction, and ordinary neural plasticity are available.
 Sleep is the internal adaptation state: recurrent activity and bounded
-plasticity continue without fresh external inputs or externally visible
-outputs. Off is complete suspension: the network does not execute until its
-validated timer returns it to sleep.
+plasticity continue without external/world inputs or externally visible
+outputs. A read-only sample of one effective recurrent weight is supplied on
+private neural inputs each sleep tick. Off is complete suspension: the network
+does not execute until its validated timer returns it to sleep.
 
 Seed genomes contain a weak two-neuron recurrent rhythm that drives the normal
 sleep and wake outputs. It is only an initialization pattern in ordinary
@@ -55,8 +56,8 @@ repurpose, or eliminate the rhythm. The substrate does not track sleep
 pressure, sleep debt, a circadian phase, or mandatory state durations.
 
 While awake, calendar inputs can influence the same recurrent network. While
-asleep, that network continues from stored hidden state without fresh calendar
-or environmental inputs, which allows an internal phase to request waking.
+asleep, that network continues from stored hidden state without calendar or
+environmental inputs, which allows an internal phase to request waking.
 Only off duration remains substrate-scheduled after a sleeping network requests
 off.
 
@@ -203,8 +204,8 @@ individual transition record.
    recurrent neural state, mutable recurrent weights, age and reward counters,
    a communication vector, and lineage metadata. The topology is fixed for a
    run.
-2. **Self-modification.** During sleep execution, a local Hebbian rule updates
-   eligible recurrent weights. Awake and off organisms do not modify them.
+2. **Self-modification.** During awake and sleep execution, a local Hebbian rule
+   updates eligible recurrent weights. Off organisms do not modify them.
    Heritable coefficients control the rule, and the host clamps every update
    and effective weight to configured limits.
 3. **Inheritance and mutation.** Each offspring needs two parents. The host
@@ -242,8 +243,9 @@ Each tick uses a stable host-controlled order:
 2. Return expired off timers to sleep, then apply state-dependent April 1
    policy before ordinary awake execution.
 3. Execute awake networks with environmental and communication inputs, or
-   asleep networks with recurrent state only. Skip off networks.
-4. Apply bounded lifetime plasticity only to sleeping networks.
+   asleep networks with recurrent state and one private recurrent-weight
+   sample. Skip off networks.
+4. Apply bounded lifetime plasticity to awake and sleeping networks.
 5. Validate and apply lifecycle requests. Waking on April 1 is fatal before an
    awake step, message, or reproduction request.
 6. Deliver communication sent only by awake organisms to awake recipients.

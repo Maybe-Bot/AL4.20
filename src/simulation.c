@@ -11,7 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define ALIFE_MAX_INPUTS 40U
+#define ALIFE_MAX_INPUTS 44U
 #define ALIFE_MAX_HIDDEN 64U
 #define ALIFE_MAX_COMMUNICATION 8U
 #define ALIFE_PLASTIC_RATE_SCALE 0.05
@@ -54,7 +54,7 @@ bool alife_layout_create(const AlifeConfig *config, AlifeLayout *layout,
     hidden = (size_t)config->hidden_size;
     communication = (size_t)config->communication_size;
     inputs = (size_t)config->input_size + communication +
-             ALIFE_PRIVATE_COURTSHIP_INPUTS;
+             ALIFE_PRIVATE_COURTSHIP_INPUTS + ALIFE_PRIVATE_SLEEP_INPUTS;
     if (hidden > ALIFE_MAX_HIDDEN || inputs > ALIFE_MAX_INPUTS ||
         communication > ALIFE_MAX_COMMUNICATION) {
         alife_set_error(error, error_size, "The neural dimensions exceed runtime limits.");
@@ -223,7 +223,8 @@ static void seed_sleep_rhythm(const AlifeWorld *world, float *genome) {
     const size_t hidden = (size_t)world->config.hidden_size;
     const size_t input_count = (size_t)world->config.input_size +
                                (size_t)world->config.communication_size +
-                               ALIFE_PRIVATE_COURTSHIP_INPUTS;
+                               ALIFE_PRIVATE_COURTSHIP_INPUTS +
+                               ALIFE_PRIVATE_SLEEP_INPUTS;
     const size_t communication = (size_t)world->config.communication_size;
     const size_t x = ALIFE_SLEEP_OSCILLATOR_X;
     const size_t y = ALIFE_SLEEP_OSCILLATOR_Y;
@@ -1096,7 +1097,8 @@ static void build_inputs(const AlifeWorld *world, size_t index, float *inputs) {
                            (double)(world->day - 1)) / 372.0;
 
     for (i = 0U; i < input_size + communication +
-                    ALIFE_PRIVATE_COURTSHIP_INPUTS; ++i) {
+                    ALIFE_PRIVATE_COURTSHIP_INPUTS +
+                    ALIFE_PRIVATE_SLEEP_INPUTS; ++i) {
         inputs[i] = 0.0F;
     }
     inputs[0] = (float)clamp_double(
@@ -1124,11 +1126,44 @@ static void build_inputs(const AlifeWorld *world, size_t index, float *inputs) {
     inputs[input_size + communication] = organism->courtship_input;
 }
 
+static float normalize_neuron_index(size_t index, size_t hidden) {
+    if (hidden <= 1U) {
+        return 0.0F;
+    }
+    return (float)(2.0 * (double)index / (double)(hidden - 1U) - 1.0);
+}
+
+static void build_sleep_inputs(AlifeWorld *world, size_t index,
+                               float *inputs) {
+    size_t hidden = (size_t)world->config.hidden_size;
+    size_t input_count = (size_t)world->config.input_size +
+                         (size_t)world->config.communication_size +
+                         ALIFE_PRIVATE_COURTSHIP_INPUTS +
+                         ALIFE_PRIVATE_SLEEP_INPUTS;
+    size_t introspection = input_count - ALIFE_PRIVATE_SLEEP_INPUTS;
+    size_t edge = (size_t)alife_rng_bounded(
+        &world->rng, (uint64_t)world->layout.recurrent_count);
+    size_t destination = edge / hidden;
+    size_t source = edge % hidden;
+    const float *slot = alife_slot_const(world, index);
+    double effective_weight =
+        (double)slot[world->layout.recurrent_weights + edge] +
+        (double)slot[world->layout.plastic_state + edge];
+
+    memset(inputs, 0, input_count * sizeof(*inputs));
+    inputs[introspection] = normalize_neuron_index(source, hidden);
+    inputs[introspection + 1U] =
+        normalize_neuron_index(destination, hidden);
+    inputs[introspection + 2U] = (float)clamp_double(
+        effective_weight / world->config.max_abs_weight, -1.0, 1.0);
+}
+
 static void execute_organism(AlifeWorld *world, size_t index, bool asleep) {
     size_t hidden = (size_t)world->config.hidden_size;
     size_t input_count = (size_t)world->config.input_size +
                          (size_t)world->config.communication_size +
-                         ALIFE_PRIVATE_COURTSHIP_INPUTS;
+                         ALIFE_PRIVATE_COURTSHIP_INPUTS +
+                         ALIFE_PRIVATE_SLEEP_INPUTS;
     size_t communication = (size_t)world->config.communication_size;
     float inputs[ALIFE_MAX_INPUTS];
     float *slot = alife_slot(world, index);
@@ -1139,18 +1174,16 @@ static void execute_organism(AlifeWorld *world, size_t index, bool asleep) {
     double plastic_magnitude = 0.0;
 
     if (asleep) {
-        memset(inputs, 0, input_count * sizeof(*inputs));
+        build_sleep_inputs(world, index, inputs);
     } else {
         build_inputs(world, index, inputs);
     }
     for (i = 0U; i < hidden; ++i) {
         double activation = (double)slot[world->layout.hidden_biases + i];
-        if (!asleep) {
-            for (j = 0U; j < input_count; ++j) {
-                activation += (double)slot[world->layout.input_weights +
-                                          i * input_count + j] *
-                              (double)inputs[j];
-            }
+        for (j = 0U; j < input_count; ++j) {
+            activation += (double)slot[world->layout.input_weights +
+                                      i * input_count + j] *
+                          (double)inputs[j];
         }
         for (j = 0U; j < hidden; ++j) {
             size_t edge = i * hidden + j;
@@ -1197,34 +1230,32 @@ static void execute_organism(AlifeWorld *world, size_t index, bool asleep) {
             }
         }
     }
-    if (asleep) {
-        for (i = 0U; i < hidden; ++i) {
-            double rate = ALIFE_PLASTIC_RATE_SCALE *
-                          tanh((double)slot[world->layout.plastic_rates + i]);
-            double decay = clamp_double(
-                world->config.plasticity_decay +
-                0.01 * tanh((double)slot[world->layout.plastic_decays + i]),
-                0.0, 1.0);
-            for (j = 0U; j < hidden; ++j) {
-                size_t edge = i * hidden + j;
-                double old_value = (double)delta[edge];
-                double value = decay * old_value + rate * (double)state[j] *
-                               (double)world->scratch_hidden[i];
-                double base = (double)slot[world->layout.recurrent_weights + edge];
-                value = clamp_double(value, -world->config.plasticity_limit,
-                                     world->config.plasticity_limit);
-                value = clamp_double(value,
-                                     -world->config.max_abs_weight - base,
-                                     world->config.max_abs_weight - base);
-                delta[edge] = (float)value;
-                plastic_magnitude += fabs(value - old_value);
-            }
+    for (i = 0U; i < hidden; ++i) {
+        double rate = ALIFE_PLASTIC_RATE_SCALE *
+                      tanh((double)slot[world->layout.plastic_rates + i]);
+        double decay = clamp_double(
+            world->config.plasticity_decay +
+            0.01 * tanh((double)slot[world->layout.plastic_decays + i]),
+            0.0, 1.0);
+        for (j = 0U; j < hidden; ++j) {
+            size_t edge = i * hidden + j;
+            double old_value = (double)delta[edge];
+            double value = decay * old_value + rate * (double)state[j] *
+                           (double)world->scratch_hidden[i];
+            double base = (double)slot[world->layout.recurrent_weights + edge];
+            value = clamp_double(value, -world->config.plasticity_limit,
+                                 world->config.plasticity_limit);
+            value = clamp_double(value,
+                                 -world->config.max_abs_weight - base,
+                                 world->config.max_abs_weight - base);
+            delta[edge] = (float)value;
+            plastic_magnitude += fabs(value - old_value);
         }
     }
     memcpy(state, world->scratch_hidden, hidden * sizeof(*state));
     ++world->organisms[index].executions;
     ++world->total_executions;
-    if (asleep && plastic_magnitude >= ALIFE_SIGNIFICANT_PLASTICITY) {
+    if (plastic_magnitude >= ALIFE_SIGNIFICANT_PLASTICITY) {
         uint64_t *changes =
             &world->organisms[index].significant_weight_changes;
         if (*changes < UINT64_MAX) {

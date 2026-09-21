@@ -486,7 +486,7 @@ bool alife_config_validate(const AlifeConfig *config, char *error,
     parameter_count =
         (uint64_t)config->hidden_size *
             ((uint64_t)config->input_size +
-             (uint64_t)config->communication_size + UINT64_C(1)) +
+             (uint64_t)config->communication_size + UINT64_C(4)) +
         (uint64_t)config->hidden_size * (uint64_t)config->hidden_size +
         (uint64_t)config->hidden_size +
         ((uint64_t)config->communication_size + UINT64_C(7)) *
