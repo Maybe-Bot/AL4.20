@@ -227,16 +227,17 @@ static void seed_sleep_rhythm(const AlifeWorld *world, float *genome) {
     const size_t communication = (size_t)world->config.communication_size;
     const size_t x = ALIFE_SLEEP_OSCILLATOR_X;
     const size_t y = ALIFE_SLEEP_OSCILLATOR_Y;
-    const double angle = 0.14;
-    const double gain = 1.12;
+    /* The nonlinear oscillator settles near a 1,000-tick period. */
+    const double angle = 0.00975;
+    const double gain = 1.02;
     const size_t sleep_output = communication + ALIFE_OUTPUT_SLEEP;
     const size_t wake_output = communication + ALIFE_OUTPUT_WAKE;
     const size_t off_output = communication + ALIFE_OUTPUT_OFF;
     size_t i;
 
     for (i = 0U; i < input_count; ++i) {
-        genome[world->layout.input_weights + x * input_count + i] *= 0.05F;
-        genome[world->layout.input_weights + y * input_count + i] *= 0.05F;
+        genome[world->layout.input_weights + x * input_count + i] = 0.0F;
+        genome[world->layout.input_weights + y * input_count + i] = 0.0F;
     }
     for (i = 0U; i < hidden; ++i) {
         genome[world->layout.recurrent_weights + x * hidden + i] = 0.0F;
@@ -255,9 +256,9 @@ static void seed_sleep_rhythm(const AlifeWorld *world, float *genome) {
         bounded_gene(world, gain * cos(angle));
 
     genome[world->layout.hidden_biases + x] = bounded_gene(
-        world, 0.035 + 0.02 * (double)genome[world->layout.hidden_biases + x]);
+        world, 0.00001 + 0.000002 * (double)genome[world->layout.hidden_biases + x]);
     genome[world->layout.hidden_biases + y] = bounded_gene(
-        world, 0.005 + 0.02 * (double)genome[world->layout.hidden_biases + y]);
+        world, 0.000001 + 0.000002 * (double)genome[world->layout.hidden_biases + y]);
     genome[world->layout.plastic_rates + x] = 0.0F;
     genome[world->layout.plastic_rates + y] = 0.0F;
 
@@ -334,7 +335,8 @@ static bool mutate_related_rhythm_gene(AlifeWorld *world, float *genome,
     const double magnitude = world->config.mutation_magnitude;
     const double direction = alife_rng_bounded(&world->rng, 2U) == 0U ?
                              -1.0 : 1.0;
-    const double size = magnitude * (0.1 + 0.1 * alife_rng_unit(&world->rng));
+    const double size = magnitude *
+                        (0.00005 + 0.00005 * alife_rng_unit(&world->rng));
     const float old_value = genome[position];
     double value;
 

@@ -400,19 +400,20 @@ static enum test_result test_seeded_neural_sleep_rhythm(void)
     uint64_t ids[2];
     uint64_t first_sleep[2] = {UINT64_MAX, UINT64_MAX};
     uint64_t first_wake[2] = {UINT64_MAX, UINT64_MAX};
+    uint64_t second_sleep[2] = {UINT64_MAX, UINT64_MAX};
     uint64_t awake_samples = 0U;
     uint64_t asleep_samples = 0U;
     size_t step;
     size_t organism_index;
 
     prepare_config(&config);
-    config.tick_count = UINT64_C(300);
+    config.tick_count = UINT64_C(3000);
     config.maturity_age = UINT64_C(1000000);
     EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)), error);
     ids[0] = world.organisms[0].id;
     ids[1] = world.organisms[1].id;
 
-    for (step = 0U; step < 240U; ++step) {
+    for (step = 0U; step < 2200U; ++step) {
         EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
         for (organism_index = 0U; organism_index < 2U; ++organism_index) {
             const AlifeOrganism *organism =
@@ -428,6 +429,11 @@ static enum test_result test_seeded_neural_sleep_rhythm(void)
                 first_wake[organism_index] == UINT64_MAX) {
                 first_wake[organism_index] = world.tick;
             }
+            if (first_wake[organism_index] != UINT64_MAX &&
+                organism->state == ALIFE_STATE_ASLEEP &&
+                second_sleep[organism_index] == UINT64_MAX) {
+                second_sleep[organism_index] = world.tick;
+            }
         }
         if (alife_find_organism(&world, ids[0])->state == ALIFE_STATE_AWAKE) {
             ++awake_samples;
@@ -440,8 +446,20 @@ static enum test_result test_seeded_neural_sleep_rhythm(void)
     EXPECT_TRUE(first_sleep[1] != UINT64_MAX);
     EXPECT_TRUE(first_wake[0] != UINT64_MAX);
     EXPECT_TRUE(first_wake[1] != UINT64_MAX);
-    EXPECT_TRUE(awake_samples >= UINT64_C(60));
-    EXPECT_TRUE(asleep_samples >= UINT64_C(60));
+    EXPECT_TRUE(second_sleep[0] != UINT64_MAX);
+    EXPECT_TRUE(second_sleep[1] != UINT64_MAX);
+    for (organism_index = 0U; organism_index < 2U; ++organism_index) {
+        EXPECT_TRUE(first_wake[organism_index] - first_sleep[organism_index] >=
+                    UINT64_C(400));
+        EXPECT_TRUE(first_wake[organism_index] - first_sleep[organism_index] <=
+                    UINT64_C(600));
+        EXPECT_TRUE(second_sleep[organism_index] - first_wake[organism_index] >=
+                    UINT64_C(400));
+        EXPECT_TRUE(second_sleep[organism_index] - first_wake[organism_index] <=
+                    UINT64_C(600));
+    }
+    EXPECT_TRUE(awake_samples >= UINT64_C(800));
+    EXPECT_TRUE(asleep_samples >= UINT64_C(800));
     EXPECT_TRUE(first_sleep[0] != first_sleep[1] ||
                 first_wake[0] != first_wake[1]);
     EXPECT_TRUE(world.awake_to_asleep_transitions > 0U);
@@ -546,11 +564,11 @@ static enum test_result test_sleep_rhythm_is_reachable_across_seeds(void)
 
         prepare_config(&config);
         config.seed = seeds[seed_index];
-        config.tick_count = UINT64_C(160);
+        config.tick_count = UINT64_C(1800);
         config.maturity_age = UINT64_C(1000000);
         EXPECT_CALL(alife_world_init(&world, &config, error, sizeof(error)),
                     error);
-        for (step = 0U; step < 140U; ++step) {
+        for (step = 0U; step < 1600U; ++step) {
             EXPECT_CALL(alife_world_step(&world, error, sizeof(error)), error);
         }
         EXPECT_TRUE(world.awake_to_asleep_transitions > 0U);
@@ -1149,6 +1167,7 @@ static enum test_result test_checkpoint_resume_preserves_state(void)
     size_t step;
 
     prepare_config(&config);
+    config.tick_count = UINT64_C(1500);
     config.maturity_age = UINT64_C(1000000);
     (void)remove(TEST_CHECKPOINT_PATH);
     EXPECT_CALL(alife_world_init(&uninterrupted, &config, error,
@@ -1188,7 +1207,7 @@ static enum test_result test_checkpoint_resume_preserves_state(void)
     EXPECT_TRUE(resumed.organisms[0].back_on_tick == UINT64_C(50));
     EXPECT_TRUE(resumed.organisms[1].state != ALIFE_STATE_OFF);
 
-    for (step = 0U; step < 80U; ++step) {
+    for (step = 0U; step < 1100U; ++step) {
         EXPECT_CALL(alife_world_step(&uninterrupted, error, sizeof(error)),
                     error);
         EXPECT_CALL(alife_world_step(&resumed, error, sizeof(error)), error);

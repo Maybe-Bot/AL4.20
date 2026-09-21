@@ -103,9 +103,11 @@ always begin awake.
 
 After random genome initialization, the substrate shapes two ordinary hidden
 neurons into a weak rotating recurrent motif. Their ordinary output weights
-drive opposing sleep and wake signals. A small bias initializes nonzero hidden
-state, weak input weights leave a path for awake calendar signals, and a
-negative off bias keeps early off requests rarer than sleep requests.
+drive opposing sleep and wake signals. The seeded motif settles into an
+approximately 1,000-tick cycle, split into roughly 500 awake and 500 asleep
+ticks. A small bias initializes nonzero hidden state, seeded input weights are
+zeroed to keep environmental inputs from pinning the oscillator, and a negative
+off bias keeps early off requests rarer than sleep requests.
 
 This shaping happens only when the seed genome is created. The motif has no
 runtime scheduler, phase counter, fixed duration, or protected parameters. Its
